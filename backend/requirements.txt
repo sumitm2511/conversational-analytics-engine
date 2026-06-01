@@ -1,0 +1,23 @@
+# Server
+fastapi
+uvicorn[standard]
+python-multipart
+
+# Data
+duckdb
+pandas
+numpy
+openpyxl
+xlrd
+
+# AI / LLM
+groq
+
+# Analytics & ML
+prophet
+scikit-learn
+statsmodels
+plotly
+
+# Utils
+python-dotenv
