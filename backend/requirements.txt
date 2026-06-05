@@ -18,6 +18,7 @@ prophet
 scikit-learn
 statsmodels
 plotly
+pmdarima
 
 # Utils
 python-dotenv

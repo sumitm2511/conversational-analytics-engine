@@ -1,6 +1,6 @@
 """
-prediction_engine.py — AutoML Forecast Engine v9 (The Router Fix)
-Fixes: Removed the < 24 tournament bypass and fixed dynamic metric scoping.
+prediction_engine.py — AutoML Forecast Engine v10 (Auto-ARIMA Integration)
+Fixes: Scrubbed all indentation/invisible space errors.
 """
 
 import warnings
@@ -184,7 +184,6 @@ class ForecastEngine:
             m.update({"model": "linear", "routing_reason": "Insufficient data length; forced baseline linear model."})
             return r, m
 
-        # 🔥 THE FIX: Tournament evaluates all data > 6 periods. Metric scans entire dataset.
         eval_metric = _select_eval_metric(sub[value_col].values)
         scores = self._run_tournament(sub, date_col, value_col, freq, eval_metric)
 
@@ -278,16 +277,33 @@ class ForecastEngine:
 
         series = sub.set_index(date_col)[value_col]
         sp     = {"D":7,"W":52,"MS":12,"QS":4,"YS":1}.get(freq,12)
+        
+        # EXCEL OVERRIDE: Excel only requires 1 cycle (sp + 2). Python strictly wants 2 (sp * 2).
         use_s  = len(series) >= sp + 2 
 
         try:
+            # Attempt 1: Standard Academic Optimization 
             model = ExponentialSmoothing(
                 series, trend="add", seasonal="add" if use_s else None, seasonal_periods=sp if use_s else None, initialization_method="estimated"
             ).fit(optimized=True)
-        except:
-            model = ExponentialSmoothing(
-                series, trend="add", seasonal="add" if use_s else None, seasonal_periods=sp if use_s else None, initialization_method="heuristic"
-            ).fit(optimized=True)
+        except Exception:
+            # Attempt 2: The "Excel Mode" Aggressive Fallback
+            # If the strict Python method fails on short data, we manually inject the first 12 months as the seasonal baseline.
+            if use_s and len(series) < (sp * 2):
+                init_level = series.iloc[0]
+                s_init = series.iloc[:sp].values - init_level 
+                try:
+                    model = ExponentialSmoothing(
+                        series, trend="add", seasonal="add", seasonal_periods=sp, 
+                        initialization_method="known", initial_level=init_level, 
+                        initial_trend=0, initial_seasonal=s_init
+                    ).fit(optimized=True)
+                except:
+                    # Absolute safety fallback
+                    model = ExponentialSmoothing(series, trend="add", initialization_method="heuristic").fit(optimized=True)
+                    use_s = False
+            else:
+                model = ExponentialSmoothing(series, trend="add", seasonal="add" if use_s else None, seasonal_periods=sp if use_s else None, initialization_method="heuristic").fit(optimized=True)
 
         fc        = model.forecast(periods)
         resid_std = model.resid.std() + 1e-9
@@ -351,21 +367,28 @@ class ForecastEngine:
         return result_df, {"trend_strength": ts, "seasonality_detected": True}
 
     def _run_arima(self, sub, date_col, value_col, periods, freq):
-        from statsmodels.tsa.arima.model import ARIMA
+        import pmdarima as pm
+
         series = sub.set_index(date_col)[value_col]
 
-        try: model = ARIMA(series, order=(1, 1, 0)).fit() 
-        except: model = ARIMA(series, order=(0, 1, 1)).fit()
+        model = pm.auto_arima(
+            series,
+            seasonal=False,
+            stepwise=True,
+            suppress_warnings=True, 
+            error_action="ignore",
+            max_p=3, max_q=3
+        )
 
-        fc        = model.get_forecast(steps=periods)
-        fc_mean   = fc.predicted_mean
-        fc_ci     = fc.conf_int(alpha=0.10) 
-        resid_std = model.resid.std() + 1e-9
+        fc, conf_int = model.predict(n_periods=periods, return_conf_int=True, alpha=0.10)
+        
+        fitted = model.predict_in_sample()
+        resid_std = np.std(series.values - fitted) + 1e-9
 
         hist_df                   = sub.rename(columns={value_col: "actual"}).copy()
-        hist_df["predicted"]      = model.fittedvalues.values.round(2)
-        hist_df["lower_bound"]    = (hist_df["predicted"] - 1.645 * resid_std).round(2)
-        hist_df["upper_bound"]    = (hist_df["predicted"] + 1.645 * resid_std).round(2)
+        hist_df["predicted"]      = np.round(fitted, 2)
+        hist_df["lower_bound"]    = np.round(hist_df["predicted"] - 1.645 * resid_std, 2)
+        hist_df["upper_bound"]    = np.round(hist_df["predicted"] + 1.645 * resid_std, 2)
         hist_df["is_forecast"]    = False
 
         last_date    = series.index[-1]
@@ -374,9 +397,9 @@ class ForecastEngine:
         fore_df = pd.DataFrame({
             date_col:      future_dates.strftime("%Y-%m-%d"),
             "actual":      np.nan,
-            "predicted":   fc_mean.values.round(2),
-            "lower_bound": fc_ci.iloc[:, 0].values.round(2),
-            "upper_bound": fc_ci.iloc[:, 1].values.round(2),
+            "predicted":   np.round(fc.values, 2),
+            "lower_bound": np.round(conf_int[:, 0], 2),
+            "upper_bound": np.round(conf_int[:, 1], 2),
             "is_forecast": True,
         })
 
