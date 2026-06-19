@@ -71,6 +71,34 @@ class AnalyticsEngine:
             "raw_dtypes": {col: str(df[col].dtype) for col in df.columns},
         }
 
+    # ── NEW: Data Health Scanner ───────────────────────────────────────
+
+    def calculate_data_health(self, df: pd.DataFrame) -> dict:
+        """Scans the dataframe for missing values and duplicates to generate a health score."""
+        total_rows = len(df)
+        if total_rows == 0:
+            return {"score": 0, "warnings": ["Dataset is entirely empty."]}
+
+        total_cells = total_rows * len(df.columns)
+        missing_cells = df.isnull().sum().sum()
+        duplicate_rows = df.duplicated().sum()
+
+        # Score out of 100 based on clean cells
+        health_score = max(0, round(100 * (1 - (missing_cells / total_cells)), 1))
+
+        warnings = []
+        if missing_cells > 0:
+            warnings.append(f"Found {int(missing_cells)} missing values. (Our AI engines will automatically interpolate these during analysis).")
+        if duplicate_rows > 0:
+            warnings.append(f"Found {int(duplicate_rows)} duplicate rows. Consider cleaning your source file.")
+
+        return {
+            "score": health_score,
+            "warnings": warnings,
+            "missing_cells": int(missing_cells),
+            "duplicate_rows": int(duplicate_rows)
+        }
+
     # ── public API ─────────────────────────────────────────────────────
 
     def load_file(self, file_path: str) -> dict:
@@ -89,12 +117,17 @@ class AnalyticsEngine:
                     self._register(table_name, df)
 
         self.active_table = list(self.tables.keys())[0]
+        active_df = self.get_dataframe(self.active_table)
+        
+        # Calculate real data health
+        health_metrics = self.calculate_data_health(active_df)
 
         return {
             "tables": list(self.tables.keys()),
             "active_table": self.active_table,
             "columns": self.tables[self.active_table]["columns"],
             "table_details": self.tables,
+            "data_health": health_metrics, # Pass the real metrics to the frontend
         }
 
     def get_dataframe(self, table_name: str = None) -> pd.DataFrame:

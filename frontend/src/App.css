@@ -188,18 +188,28 @@ body {
 }
 
 /* ── Sidebar (With Full 0px Collapse Fix) ─────────────────────────────── */
+/* ── Sidebar (With Scroll Fix) ─────────────────────────────── */
 .sidebar {
   min-width: 0 !important; 
   background: #FFFFFF;
   border-right: 1px solid #E2E8F0;
   display: flex;
   flex-direction: column;
-  overflow-y: auto;
   padding-bottom: 16px;
   transition: width 0.3s cubic-bezier(0.4, 0, 0.2, 1), border 0.3s ease, padding 0.3s ease !important;
-  overflow: hidden !important;
+  /* THE FIX: Allow Y-scrolling, hide X-overflow */
+  overflow-y: auto !important; 
+  overflow-x: hidden !important;
   position: relative;
   flex-shrink: 0;
+}
+
+/* Add this wrapper class to the <div> holding your columns list */
+.sidebar-columns-wrapper {
+  flex: 1;
+  overflow-y: auto;
+  min-height: 0;
+  padding-right: 4px; /* Room for the scrollbar */
 }
 
 .sidebar-open {
@@ -430,6 +440,40 @@ body {
 }
 
 /* ── KPI Bar ──────────────────────────────────────────────────────────── */
+/* ── Data Health Warnings ────────────────────────────────────────────── */
+.health-warnings-container {
+  background: #FFFBEB;
+  border: 1px solid #FDE68A;
+  border-radius: 8px;
+  padding: 10px 14px;
+  margin-top: 12px;
+  animation: card-in 0.25s ease-out;
+}
+
+.health-warnings-title {
+  font-size: 11px;
+  font-weight: 700;
+  color: #D97706;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin-bottom: 6px;
+}
+
+.health-warning-item {
+  font-size: 12px;
+  color: #92400E;
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  margin-bottom: 4px;
+  line-height: 1.4;
+}
+
+.health-warning-item:last-child {
+  margin-bottom: 0;
+}
+
+
 .kpi-bar {
   display: grid;
   grid-template-columns: repeat(4, 1fr);

@@ -3,10 +3,10 @@ import ChartPanel  from "./ChartPanel"
 import ExportMenu  from "./ExportMenu"
 import axios       from "axios"
 import { API_BASE } from "../config"
- 
+
 const INTENT_ICONS = { sql: "⊟", forecast: "↗", regression: "⎇", trend: "∿", anomaly: "⚡", summary: "◈" }
 const INTENT_COLORS = { sql: "#6366F1", forecast: "#F59E0B", regression: "#10B981", trend: "#06B6D4", anomaly: "#F43F5E", summary: "#8B5CF6" }
- 
+
 const FOLLOWUPS = {
   sql:        ["Show trend over time", "Forecast next 3 months", "Break down by region", "Sort descending"],
   forecast:   ["Extend forecast to 24 months", "Compare by segment", "Show historical only", "Detect anomalies"],
@@ -15,16 +15,16 @@ const FOLLOWUPS = {
   regression: ["Show top feature drivers", "Compare actual vs predicted", "Run forecast instead"],
   summary:    ["Show sales trend", "Which region performs best?", "Detect anomalies"],
 }
- 
+
 export default function ResultPanel({ result, sessionId, onFollowUp }) {
   const [activeTab,    setActiveTab]    = useState("Summary")
   const [chartData,    setChartData]    = useState(result.chart || null)
   const [chartLoading, setChartLoading] = useState(false)
   
-  // 🔥 NEW: Collapse State for UI Cleanliness
+  // Collapse State for UI Cleanliness
   const [isCollapsed,  setIsCollapsed]  = useState(false)
   const chartRef = useRef()
- 
+
   useEffect(() => {
     setChartData(result.chart || null)
     setActiveTab("Summary") 
@@ -32,7 +32,7 @@ export default function ResultPanel({ result, sessionId, onFollowUp }) {
   }, [result])
 
   if (!result) return null
- 
+
   if (result.error) return (
     <div className="result-card error-card">
       <div className="error-header">
@@ -42,22 +42,22 @@ export default function ResultPanel({ result, sessionId, onFollowUp }) {
       <div className="error-msg"><strong>Query failed:</strong> {result.error}</div>
     </div>
   )
- 
+
   const type   = result.type || "sql"
   const chips  = FOLLOWUPS[type] || FOLLOWUPS.sql
   const color  = INTENT_COLORS[type] || "#6366F1"
- 
+
   const tabs = ["Summary"]
   if (chartData)     tabs.push("Chart")
   if (result.rows?.length > 0) tabs.push("Table")
   if (result.sql)    tabs.push("SQL")
   if (result.insights) tabs.push("Insights")
- 
+
   const insights    = result.insights || {}
   const kpis        = insights.kpis || {}
   const hasKpis     = Object.keys(kpis).length > 0
   const hasMetrics  = result.metrics && Object.keys(result.metrics).length > 0
- 
+
   async function handleRequestChart(chartType) {
     if (!sessionId) return
     setChartLoading(true)
@@ -67,7 +67,7 @@ export default function ResultPanel({ result, sessionId, onFollowUp }) {
       if (data.chart) setChartData(data.chart)
     } catch (e) { console.error(e) } finally { setChartLoading(false) }
   }
- 
+
   return (
     <div className={`result-card ${isCollapsed ? 'collapsed' : ''}`}>
       
@@ -80,7 +80,7 @@ export default function ResultPanel({ result, sessionId, onFollowUp }) {
         <div className="result-header-right" style={{ display: "flex", gap: "8px" }}>
           {!isCollapsed && <ExportMenu data={result.rows} columns={result.columns} chartRef={chartData ? chartRef : null} question={result.question} />}
           
-          {/* 🔥 NEW: Collapse/Expand Button */}
+          {/* Collapse/Expand Button */}
           <button 
             className="card-icon-btn" 
             onClick={() => setIsCollapsed(!isCollapsed)}
@@ -91,7 +91,7 @@ export default function ResultPanel({ result, sessionId, onFollowUp }) {
           </button>
         </div>
       </div>
- 
+
       {/* ── BODY (Hidden when collapsed) ── */}
       {!isCollapsed && (
         <>
@@ -102,7 +102,7 @@ export default function ResultPanel({ result, sessionId, onFollowUp }) {
               ))}
             </div>
           )}
-     
+      
           <div className="tab-bar">
             {tabs.map(tab => (
               <button key={tab} className={`tab-btn ${activeTab === tab ? "active" : ""}`} style={activeTab === tab ? { borderBottomColor: color, color } : {}} onClick={() => setActiveTab(tab)}>
@@ -111,7 +111,7 @@ export default function ResultPanel({ result, sessionId, onFollowUp }) {
               </button>
             ))}
           </div>
-     
+      
           <div className="tab-content">
             {activeTab === "Summary" && (
               <div className="summary-tab">
@@ -128,9 +128,55 @@ export default function ResultPanel({ result, sessionId, onFollowUp }) {
                     {insights.anomalies.map((a, i) => <div key={i} className="anomaly-flag">{a}</div>)}
                   </div>
                 )}
+                
+                {/* 🔥 NEW: FORECAST ML TOURNAMENT LEADERBOARD 🔥 */}
+                {result.type === "forecast" && result.forecast_leaderboard?.length > 0 && (
+                  <div className="forecast-leaderboard" style={{ marginTop: "24px", background: "#f8fafc", padding: "16px", borderRadius: "8px", border: "1px solid #e2e8f0" }}>
+                    <h4 style={{ margin: "0 0 12px 0", color: "#0f172a", fontSize: "14px" }}>
+                      🏆 Model Tournament — {result.primary_metric} used for selection
+                    </h4>
+                    
+                    <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "13px", textAlign: "left" }}>
+                      <thead>
+                        <tr style={{ borderBottom: "2px solid #cbd5e1", color: "#64748b" }}>
+                          <th style={{ padding: "8px" }}>Model</th>
+                          <th style={{ padding: "8px" }}>{result.primary_metric}</th>
+                          <th style={{ padding: "8px" }}>MAE</th>
+                          <th style={{ padding: "8px" }}>RMSE</th>
+                          <th style={{ padding: "8px" }}>Status</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {result.forecast_leaderboard.map((row, i) => (
+                          <tr key={i} style={{ 
+                            borderBottom: "1px solid #e2e8f0",
+                            background: row.selected === "✓" ? "rgba(16, 185, 129, 0.1)" : "transparent",
+                            fontWeight: row.selected === "✓" ? "600" : "400"
+                          }}>
+                            <td style={{ padding: "10px 8px", color: "#0f172a" }}>{row.model}</td>
+                            <td style={{ padding: "10px 8px" }}>{row[result.primary_metric]}</td>
+                            <td style={{ padding: "10px 8px" }}>{row.MAE}</td>
+                            <td style={{ padding: "10px 8px" }}>{row.RMSE}</td>
+                            <td style={{ padding: "10px 8px", color: row.selected === "✓" ? "#059669" : "#94a3b8" }}>
+                              {row.selected === "✓" ? "Winner" : "Eliminated"}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                    
+                    <p style={{ margin: "12px 0 0 0", fontSize: "11px", color: "#64748b", fontStyle: "italic" }}>
+                      *Metric selected: {result.primary_metric} 
+                      {result.primary_metric === "MAE" && " (Data contains zeros/near-zeros)"}
+                      {result.primary_metric === "RMSE" && " (High volatility detected in historical data)"}
+                      {result.primary_metric === "SMAPE" && " (Standard scale-independent metric)"}
+                    </p>
+                  </div>
+                )}
+                
                 {result.rows?.length > 0 && (
                   <>
-                    <div className="preview-label">Data preview</div>
+                    <div className="preview-label" style={{ marginTop: "24px" }}>Data preview</div>
                     <div className="table-wrap preview-table">
                       <table className="data-table">
                         <thead><tr>{result.columns.map(c => <th key={c}>{c}</th>)}</tr></thead>
@@ -148,9 +194,9 @@ export default function ResultPanel({ result, sessionId, onFollowUp }) {
                 )}
               </div>
             )}
-     
+      
             {activeTab === "Chart" && <ChartPanel ref={chartRef} chart={chartData} loading={chartLoading} onRequestChart={handleRequestChart} />}
-     
+      
             {activeTab === "Table" && result.rows && (
               <div>
                 <div className="table-wrap full-table">
@@ -164,14 +210,14 @@ export default function ResultPanel({ result, sessionId, onFollowUp }) {
                 {result.total_rows > 500 && <div className="table-note">Showing 500 of {result.total_rows.toLocaleString()} rows</div>}
               </div>
             )}
-     
+      
             {activeTab === "SQL" && result.sql && (
               <div className="sql-panel">
                 <div className="sql-panel-header"><span>Generated SQL</span><button className="copy-btn" onClick={() => navigator.clipboard.writeText(result.sql)}>Copy</button></div>
                 <pre className="sql-block">{result.sql}</pre>
               </div>
             )}
-     
+      
             {activeTab === "Insights" && (
               <div className="insights-full">
                 {insights.summary && <div className="insight-section"><div className="insight-section-title">Summary</div><p style={{ fontSize: "14px" }}>{insights.summary}</p></div>}
@@ -181,7 +227,7 @@ export default function ResultPanel({ result, sessionId, onFollowUp }) {
               </div>
             )}
           </div>
-     
+      
           <div className="followup-row">
             <span className="followup-label">Ask next →</span>
             {chips.map(c => <button key={c} className="followup-chip" onClick={() => onFollowUp && onFollowUp(c)}>{c}</button>)}
