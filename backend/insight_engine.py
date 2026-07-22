@@ -1,6 +1,6 @@
 """
 insight_engine.py  —  Upgraded
-- Intent-specific prompts for forecast / trend / anomaly / regression / sql
+- Intent-specific prompts for forecast / trend / anomaly / regression / sql / classification
 - Passes statistical metadata (CAGR, trend_strength, anomaly narrative) to the LLM
 - Returns richer structure with kpis, narrative, and confidence
 """
@@ -121,6 +121,14 @@ Focus on:
 - The most important predictive features and their business significance
 - Practical interpretation: what drives the target variable
 - Limitations and where the model may be wrong
+""",
+            "classification": """
+Focus on:
+- Overall accuracy and weighted F1 score, and what they mean in plain English
+- Which classes the model confuses most often (infer from the confusion matrix if described)
+- The most important predictive features and their business significance
+- Whether class imbalance is present and how it might affect reliability
+- Practical guidance on how much to trust an individual prediction from this model
 """,
             "sql": """
 Focus on:

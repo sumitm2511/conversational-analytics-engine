@@ -437,15 +437,15 @@ def _fit_sarima(sub, date_col, value_col, periods, freq, cv_val, needs_log, feat
 
 def _fit_prophet(sub, date_col, value_col, periods, freq, cv_val, needs_log, feature_cols=None):
     from prophet import Prophet
-    
+
     y_vals = np.log1p(sub[value_col]) if needs_log else sub[value_col]
     df_p   = pd.DataFrame({"ds": sub[date_col], "y": y_vals}).dropna(subset=["y"])
-    
+
     if feature_cols:
         for f_col in feature_cols:
             if f_col in sub.columns:
                 df_p[f_col] = sub[f_col].values
-                
+
     s_mode = "multiplicative" if df_p["y"].min() > 0 else "additive"
     cps    = 0.3 if cv_val > 0.5 else 0.15
     use_s  = len(df_p) >= _periods_per_year(freq)
@@ -455,12 +455,12 @@ def _fit_prophet(sub, date_col, value_col, periods, freq, cv_val, needs_log, fea
         interval_width=0.90, changepoint_prior_scale=cps, seasonality_mode=s_mode,
     )
     if use_s: model.add_country_holidays(country_name="US")
-    
+
     if feature_cols:
         for f_col in feature_cols:
             if f_col in df_p.columns:
                 model.add_regressor(f_col)
-                
+
     model.fit(df_p)
 
     future = model.make_future_dataframe(periods=periods, freq=freq)
@@ -469,7 +469,7 @@ def _fit_prophet(sub, date_col, value_col, periods, freq, cv_val, needs_log, fea
             if f_col in df_p.columns:
                 recent_avg = df_p[f_col].tail(3).mean()
                 future[f_col] = list(df_p[f_col]) + [recent_avg] * periods
-                
+
     forecast     = model.predict(future)
     fitted_raw   = np.asarray(forecast["yhat"].iloc[:len(sub)])
     fc_raw       = np.asarray(forecast["yhat"].tail(periods))
@@ -496,7 +496,7 @@ def _fit_prophet(sub, date_col, value_col, periods, freq, cv_val, needs_log, fea
         "is_forecast": True,
     })
     hist_df[date_col] = hist_df[date_col].dt.strftime("%Y-%m-%d")
-    
+
     meta_desc = "Multivariate Prophet (with Regressors)" if feature_cols else "Prophet"
     return pd.concat([hist_df, fore_df], ignore_index=True), {"model_display": meta_desc, "seasonality_detected": use_s}, fc
 
@@ -613,12 +613,12 @@ class ForecastEngine:
                 if group is not None
                 else df.copy()
             )
-            
+
             agg_dict = {value_col: agg_func}
             for f in f_cols:
                 if f in sub.columns:
                     agg_dict[f] = "mean"
-                    
+
             sub      = sub.groupby(pd.Grouper(key=date_col, freq=freq)).agg(agg_dict).reset_index()
             full_idx = pd.date_range(sub[date_col].min(), sub[date_col].max(), freq=freq)
             sub      = sub.set_index(date_col).reindex(full_idx).rename_axis(date_col).reset_index()
@@ -627,7 +627,7 @@ class ForecastEngine:
                 sub[value_col] = sub[value_col].fillna(0)
             else:
                 sub[value_col] = sub[value_col].interpolate(method="linear").bfill().ffill()
-                
+
             for f in f_cols:
                 if f in sub.columns:
                     sub[f] = sub[f].interpolate(method="linear").bfill().ffill()
@@ -982,6 +982,134 @@ class ForecastEngine:
         return " ".join(parts)
 
 
+# ── Shared Classifier Tournament ────────────────────────────────────────────────
+# Same philosophy as ForecastEngine's model tournament above: try several
+# candidate algorithms, score them honestly via cross-validation, pick a
+# winner, and report the full leaderboard rather than silently committing to
+# one hardcoded model. Used by both ClusterEngine (to pick the model that
+# powers predict_point on discovered clusters) and SupervisedClassifierEngine
+# (to pick the model that predicts a real label column).
+
+def _run_classifier_tournament(X, y, min_folds: int = 2, max_folds: int = 5, random_state: int = 42) -> Dict:
+    """
+    Compares Random Forest, Gradient Boosting, Extra Trees, Logistic Regression,
+    and K-Nearest Neighbors via stratified k-fold CV, selecting the winner by
+    weighted F1 (robust to class imbalance) with accuracy and log-loss reported
+    alongside for transparency. Log-loss matters specifically here because these
+    models' predict_proba output is what gets shown to users as "confidence %" —
+    a poorly-calibrated model can report high confidence while being wrong far
+    more often than that number implies.
+
+    Returns:
+      {
+        "winner":         <model name str>,
+        "model":          <fitted sklearn estimator, refit on ALL of X/y>,
+        "leaderboard":    [ {"model": name, "f1_weighted": .., "accuracy": .., "log_loss": .., "selected": "✓"/""} , ... ],
+        "cv_folds":       int or None,
+        "skipped_reason": str or None,   # set when CV wasn't possible (too few samples per class)
+      }
+    """
+    from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier, ExtraTreesClassifier
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.neighbors import KNeighborsClassifier
+    from sklearn.model_selection import StratifiedKFold, cross_validate
+
+    y = np.asarray(y)
+    classes, counts = np.unique(y, return_counts=True)
+    min_class_count = int(counts.min()) if len(counts) else 0
+
+    candidates = {
+        "Random Forest": RandomForestClassifier(
+            n_estimators=150, max_depth=8, random_state=random_state, class_weight="balanced"
+        ),
+        "Gradient Boosting": GradientBoostingClassifier(
+            n_estimators=100, max_depth=3, random_state=random_state
+        ),
+        "Extra Trees": ExtraTreesClassifier(
+            n_estimators=150, max_depth=8, random_state=random_state, class_weight="balanced"
+        ),
+        "Logistic Regression": LogisticRegression(
+            max_iter=1000, class_weight="balanced", random_state=random_state
+        ),
+        "K-Nearest Neighbors": KNeighborsClassifier(
+            n_neighbors=min(15, max(3, min_class_count))
+        ),
+    }
+
+    # Not enough samples in the smallest class to cross-validate at all —
+    # mirrors ForecastEngine's short-series "In-Sample" fallback: don't error,
+    # just fall back to a single safe default and say so honestly.
+    if min_class_count < 2 or len(classes) < 2:
+        model = candidates["Random Forest"]
+        model.fit(X, y)
+        return {
+            "winner": "Random Forest",
+            "model": model,
+            "leaderboard": [],
+            "cv_folds": None,
+            "skipped_reason": (
+                f"Only {min_class_count} sample(s) in the smallest class — need at least 2 "
+                "for cross-validated model comparison, so a single default model was used instead."
+            ),
+        }
+
+    n_folds = max(min_folds, min(max_folds, min_class_count))
+    cv = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=random_state)
+
+    leaderboard = []
+    fitted_candidates = {}
+
+    for name, model in candidates.items():
+        try:
+            scores = cross_validate(
+                model, X, y, cv=cv,
+                scoring=["f1_weighted", "accuracy", "neg_log_loss"],
+                error_score=np.nan,
+            )
+            f1  = float(np.nanmean(scores["test_f1_weighted"]))
+            acc = float(np.nanmean(scores["test_accuracy"]))
+            ll_raw = np.nanmean(scores["test_neg_log_loss"])
+            ll  = float(-ll_raw) if not np.isnan(ll_raw) else None
+            if np.isnan(f1):
+                continue
+            leaderboard.append({
+                "model": name,
+                "f1_weighted": round(f1, 4),
+                "accuracy": round(acc, 4),
+                "log_loss": round(ll, 4) if ll is not None else None,
+            })
+            fitted_candidates[name] = model
+        except Exception:
+            continue
+
+    if not leaderboard:
+        model = candidates["Random Forest"]
+        model.fit(X, y)
+        return {
+            "winner": "Random Forest",
+            "model": model,
+            "leaderboard": [],
+            "cv_folds": n_folds,
+            "skipped_reason": "All tournament candidates failed cross-validation; used Random Forest as a safe default.",
+        }
+
+    leaderboard.sort(key=lambda r: r["f1_weighted"], reverse=True)
+    winner_name  = leaderboard[0]["model"]
+    winner_model = fitted_candidates[winner_name]
+    winner_model.fit(X, y)   # refit the winner on ALL provided data for production use
+
+    for row in leaderboard:
+        row["selected"] = "✓" if row["model"] == winner_name else ""
+
+    return {
+        "winner": winner_name,
+        "model": winner_model,
+        "leaderboard": leaderboard,
+        "cv_folds": n_folds,
+        "skipped_reason": None,
+    }
+
+
 # ── Trend Engine ───────────────────────────────────────────────────────────────
 
 class TrendEngine:
@@ -1090,6 +1218,7 @@ class RegressionEngine:
         from sklearn.model_selection import train_test_split
         from sklearn.metrics import r2_score, mean_absolute_error
         from sklearn.preprocessing import LabelEncoder
+        import pandas.api.types as ptypes
 
         missing = [c for c in [target_col] + feature_cols if c not in df.columns]
         if missing:
@@ -1100,14 +1229,28 @@ class RegressionEngine:
             return {"error": "Need at least 20 rows for regression."}
 
         for col in feature_cols:
-            if sub[col].dtype == object:
+            # NOTE: was `if sub[col].dtype == object:` — that check silently
+            # fails to catch pandas' newer native "string"/"str" dtype (seen
+            # from pandas >= 2.x onward when reading Excel/CSV columns), so
+            # a categorical column like "region" would never get LabelEncoded
+            # and would instead go straight into pd.to_numeric(), which fails
+            # on every row of real text and wipes the whole column to NaN —
+            # collapsing the entire dataset to 0 rows on the final dropna().
+            # Fix: explicitly check "is this NOT already numeric" rather than
+            # relying on the exact legacy `object` dtype tag.
+            if not ptypes.is_numeric_dtype(sub[col]):
                 sub[col] = LabelEncoder().fit_transform(sub[col].astype(str))
-            sub[col] = pd.to_numeric(sub[col], errors="coerce")
+            else:
+                sub[col] = pd.to_numeric(sub[col], errors="coerce")
         sub = sub.dropna()
+
+        if len(sub) < 20:
+            return {"error": f"Only {len(sub)} valid rows remained after encoding features — need at least 20."}
 
         X, y = sub[feature_cols].values, sub[target_col].values
         if len(sub) > 5000:
-            idx  = np.random.choice(len(sub), 5000, replace=False)
+            rng  = np.random.RandomState(42)
+            idx  = rng.choice(len(sub), 5000, replace=False)
             X, y = X[idx], y[idx]
 
         X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
@@ -1265,18 +1408,30 @@ class AnomalyEngine:
         return df
 
 
-# ── Cluster Engine (V20 - HDBSCAN + UMAP) ──────────────────────────────────────
+# ── Cluster Engine (V20.1 - Predictive HDBSCAN + UMAP) ─────────────────────────
 
 class ClusterEngine:
     """
-    Advanced non-linear clustering:
+    Advanced non-linear clustering with predictive mapping:
     - HDBSCAN for density-based grouping and native noise identification.
     - UMAP for 2D topological mapping.
-    - Fallbacks to KMeans / PCA if libraries are missing or data is constrained.
+    - Post-hoc Random Forest Classifier for new-point classification.
+    - Consistent categorical encoding via stored category levels (bug fix).
     """
 
     def __init__(self):
-        self._groq_client = None
+        self._groq_client  = None
+        # ── State persisted across run() → predict_point() calls ──
+        self.scaler          = None
+        self.encoded_cols    = None   # column order the model was trained on
+        self.feature_cols    = None   # original feature columns requested
+        self.cat_mappings    = {}     # {col: [sorted list of all categories]}
+        self.clf             = None   # production classifier
+        self.cluster_profiles = None
+        self.feature_defaults = {}    # {col: median (numeric) or mode (categorical)} — used to
+                                       # impute missing fields in predict_point() rather than hard-fail
+
+    # ── Groq lazy init (unchanged) ─────────────────────────────────────────────
 
     def _get_groq_client(self):
         if self._groq_client is not None:
@@ -1285,26 +1440,82 @@ class ClusterEngine:
             import os
             from groq import Groq
             key = os.getenv("GROQ_API_KEY")
-            if not key: return None
+            if not key:
+                return None
             self._groq_client = Groq(api_key=key)
             return self._groq_client
         except Exception:
             return None
 
-    def _generate_labels(self, profiles: dict) -> dict:
+    def _compute_distinguishing_features(self, valid_clusters: "pd.DataFrame", numeric_cols: list, top_n: int = 3) -> dict:
+        """
+        For each cluster, finds which numeric features deviate most (in % terms)
+        from the OVERALL dataset average. This is the fix for vague naming: raw
+        cluster averages (e.g. "fte=0.9") don't tell an LLM what's actually
+        DIFFERENT about a cluster, so it falls back to generic words like
+        "Medium Users". Framing it as "fte is 42% above the overall average"
+        gives the naming step something genuinely distinguishing to describe.
+        """
+        import pandas as pd
+        if valid_clusters.empty or not len(numeric_cols):
+            return {}
+
+        overall_means = valid_clusters[numeric_cols].mean()
+        result = {}
+
+        for cluster_name, group in valid_clusters.groupby("Cluster"):
+            cluster_means = group[numeric_cols].mean()
+            deltas = []
+            for col in numeric_cols:
+                overall = overall_means[col]
+                cluster_val = cluster_means[col]
+                if abs(overall) < 1e-9:
+                    continue
+                pct_diff = (cluster_val - overall) / abs(overall) * 100
+                deltas.append((col, pct_diff, cluster_val))
+
+            deltas.sort(key=lambda x: abs(x[1]), reverse=True)
+
+            descriptions = []
+            for col, pct_diff, cluster_val in deltas[:top_n]:
+                direction = "above" if pct_diff > 0 else "below"
+                descriptions.append(
+                    f"{col} is {abs(pct_diff):.0f}% {direction} the overall dataset average "
+                    f"(cluster avg: {cluster_val:.2f})"
+                )
+            result[cluster_name] = descriptions
+
+        return result
+
+    def _generate_labels(self, profiles: dict, distinguishing: dict = None, domain_context: str = None) -> dict:
         import json
         client = self._get_groq_client()
-        if client is None: return {}
+        if client is None:
+            return {}
+
+        distinguishing = distinguishing or {}
+        context_line = f"\nDomain context provided by the user: {domain_context}\n" if domain_context else ""
 
         prompt = (
-            "You are an expert business strategist and data analyst.\n"
-            "I have segmented my data into distinct clusters. Here are the average feature values:\n"
+            "You are an expert business strategist naming customer/resource segments.\n"
+            f"{context_line}"
+            "Below is what makes each cluster DIFFERENT from the overall dataset average — use these "
+            "distinguishing factors as the PRIMARY basis for naming, not raw averages alone:\n\n"
+            f"{json.dumps(distinguishing, indent=2)}\n\n"
+            "For additional grounding, here are the raw average feature values per cluster:\n"
             f"{json.dumps(profiles, indent=2)}\n\n"
-            "Give each cluster a highly descriptive, 2-3 word 'Persona Name' based on these averages.\n"
-            "(e.g., 'High-Value Savers', 'At-Risk Churners', 'Premium Winners').\n\n"
+            "Naming rules:\n"
+            "- Give each cluster a sharp, specific, 2-4 word 'Persona Name' that reflects its most "
+            "distinguishing factor(s) — not a generic catch-all label.\n"
+            "- AVOID vague words as the primary descriptor: 'Users', 'Group', 'Segment', 'Medium', "
+            "'Average', 'Standard', 'Regular' should not carry the name on their own.\n"
+            "- Prefer names that reference the actual driving factor AND its direction, e.g. "
+            "'High-Utilization Specialists', 'Low-FTE Contributors', 'Premium Cost Drivers' — "
+            "not 'Medium Users' or 'Group A'.\n"
+            "- Every persona name you return MUST be unique across all clusters — even if two clusters "
+            "look statistically similar, choose distinguishing wording rather than reusing a name.\n\n"
             "Return ONLY a valid JSON object where keys are the exact original cluster names "
-            "(e.g., 'Cluster 0') and values are the 2-3 word persona strings. "
-            "No markdown, no explanations."
+            "(e.g., 'Cluster 0') and values are the persona name strings. No markdown, no explanations."
         )
         try:
             resp = client.chat.completions.create(
@@ -1313,17 +1524,318 @@ class ClusterEngine:
                 temperature=0.3,
                 response_format={"type": "json_object"},
             )
-            return json.loads(resp.choices[0].message.content.strip())
+            labels = json.loads(resp.choices[0].message.content.strip())
+            return self._dedupe_labels(labels)
         except Exception as e:
             print(f"[ClusterEngine] Auto-labeling failed: {e}")
             return {}
 
-    def run(self, df, feature_cols):
+    def _dedupe_labels(self, labels: dict) -> dict:
+        """
+        Guards against the LLM reusing the same persona name for multiple
+        distinct clusters (e.g. giving 3 different clusters the name "Medium
+        Users" because their profiles look superficially similar). If that
+        happens, downstream code that colors/groups by the "Cluster" column
+        silently merges those distinct clusters into one visual group, even
+        though the underlying cluster assignments (and the reported k) are
+        still correct. Here we detect collisions and disambiguate by
+        appending a numeric suffix, so every original cluster keeps a
+        distinct label.
+        """
+        seen: dict = {}
+        deduped = {}
+        for original_cluster, name in labels.items():
+            if name not in seen:
+                seen[name] = 1
+                deduped[original_cluster] = name
+            else:
+                seen[name] += 1
+                deduped[original_cluster] = f"{name} ({seen[name]})"
+        return deduped
+
+    # ── Consistent encoding helper (THE CORE FIX) ──────────────────────────────
+
+    def _encode_consistent(self, df_in: "pd.DataFrame") -> "pd.DataFrame":
+        """
+        Encode a DataFrame using stored category levels from training.
+
+        Why this matters:
+          pd.get_dummies on a single-row DataFrame only sees the ONE value
+          present in that row. With drop_first=True it then drops the only
+          dummy it created, so every category value collapses to all-zeros.
+
+          By using pd.Categorical with the FULL list of categories seen
+          during training, pandas always emits one column per level —
+          even when only a single row (or a subset of levels) is present.
+          drop_first=False ensures no information is silently discarded.
+
+        After encoding we align to self.encoded_cols so the feature matrix
+        always has the exact same shape and column order the model expects.
+        """
+        import pandas as pd
+        df_copy = df_in.copy()
+
+        # Apply stored categories to each known categorical column
+        for col, cats in self.cat_mappings.items():
+            if col in df_copy.columns:
+                # Cast to Categorical with all training-time levels
+                df_copy[col] = pd.Categorical(df_copy[col], categories=cats)
+
+        # drop_first=False: every level keeps its column
+        encoded = pd.get_dummies(df_copy, drop_first=False)
+
+        # Align to the training column order (fill any unseen cols with 0)
+        if self.encoded_cols is not None:
+            final = pd.DataFrame(0, index=df_copy.index, columns=self.encoded_cols)
+            for col in self.encoded_cols:
+                if col in encoded.columns:
+                    final[col] = encoded[col].values
+            return final
+
+        return encoded
+
+    # ── run() ──────────────────────────────────────────────────────────────────
+
+    # ── Context-aware clustering algorithm selection ────────────────────────────
+
+    def _select_clustering_algorithm(self, sub: "pd.DataFrame", feature_cols: list,
+                                       scaled_data, encoded_df: "pd.DataFrame") -> Optional[Dict]:
+        """
+        Profiles the data (row count, categorical-vs-numeric mix, post-encoding
+        dimensionality) and runs a shortlist of ELIGIBLE clustering algorithms
+        for that shape of data, scoring each with a composite of three
+        unsupervised quality metrics — Silhouette, Davies-Bouldin, and
+        Calinski-Harabasz — rather than a single score, since silhouette alone
+        can be misleading for density-based methods that produce noise points,
+        or when comparing fundamentally different algorithms against each other.
+
+        All candidates are scored on the SAME standardized one-hot feature
+        space (scaled_data) for a fair apples-to-apples comparison — even
+        K-Prototypes, which actually PERFORMS its clustering on the raw
+        mixed-type data (treating categories natively via Hamming distance
+        instead of exploding them into sparse dummy columns), has its
+        resulting assignment evaluated on scaled_data just like every other
+        candidate. This is what makes K-Prototypes eligible in the first
+        place: one-hot encoding a lot of categorical columns dilutes numeric
+        signal, so when a meaningful share of the requested features are
+        categorical, K-Prototypes gets a real chance to compete instead of
+        being silently unavailable.
+
+        Returns None if no candidate produced anything usable (caller falls
+        back to the older fixed HDBSCAN → K-Means logic).
+        """
+        from sklearn.metrics import silhouette_score, davies_bouldin_score, calinski_harabasz_score
+
+        n_rows = len(scaled_data)
+        cat_ratio = (len(self.cat_mappings) / len(feature_cols)) if feature_cols else 0
+
+        candidates = {}   # name -> (labels array, extra_meta dict)
+
+        # ── HDBSCAN — always eligible; strong default for numeric-heavy data,
+        # native noise detection. Searches a few min_cluster_size fractions
+        # rather than one fixed guess (n_rows // 15 alone can produce 100%
+        # noise on tightly-grouped data — confirmed on real test data during
+        # development), same spirit as the k-search every other candidate does. ──
+        try:
+            try:
+                from sklearn.cluster import HDBSCAN
+            except ImportError:
+                from hdbscan import HDBSCAN
+
+            best_score, best_labels, best_min_sz = -1, None, None
+            for frac in (0.01, 0.02, 0.03, 0.05, 1.0 / 15):
+                min_sz = max(5, int(n_rows * frac))
+                try:
+                    lbls = HDBSCAN(min_cluster_size=min_sz).fit_predict(scaled_data)
+                except Exception:
+                    continue
+                mask = lbls != -1
+                if mask.sum() < 3 or len(np.unique(lbls[mask])) < 2:
+                    continue
+                # A candidate that's mostly noise isn't usable even if its
+                # silhouette on the small inlier remainder looks decent.
+                if mask.sum() / n_rows < 0.5:
+                    continue
+                # Same "usable for a human audience" cap as the leaderboard
+                # filter below — a very small min_cluster_size can carve
+                # categorical-heavy data into dozens of tight micro-clusters
+                # that score well statistically but aren't a usable persona set.
+                if len(np.unique(lbls[mask])) > 15:
+                    continue
+                score = silhouette_score(scaled_data[mask], lbls[mask])
+                if score > best_score:
+                    best_score, best_labels, best_min_sz = score, lbls, min_sz
+
+            if best_labels is not None:
+                candidates["HDBSCAN"] = (best_labels, {"handles_noise": True, "min_cluster_size": best_min_sz})
+        except Exception:
+            pass
+
+        # ── K-Means — always eligible; fast, good baseline for roughly
+        # spherical clusters. ──
+        try:
+            from sklearn.cluster import KMeans
+            best_k, best_score, best_labels = None, -1, None
+            max_k = min(12, max(2, n_rows // 15))
+            for k in range(2, max_k + 1):
+                if k >= n_rows: break
+                km = KMeans(n_clusters=k, random_state=42, n_init="auto")
+                lbls = km.fit_predict(scaled_data)
+                if len(np.unique(lbls)) < 2: continue
+                score = silhouette_score(scaled_data, lbls)
+                if score > best_score:
+                    best_k, best_score, best_labels = k, score, lbls
+            if best_labels is not None:
+                candidates["K-Means"] = (best_labels, {"handles_noise": False, "k": best_k})
+        except Exception:
+            pass
+
+        # ── Gaussian Mixture — eligible for moderate dataset sizes; captures
+        # elliptical/overlapping clusters and gives soft membership natively. ──
+        try:
+            if n_rows <= 50000:
+                from sklearn.mixture import GaussianMixture
+                best_k, best_score, best_labels = None, -1, None
+                max_k = min(10, max(2, n_rows // 20))
+                for k in range(2, max_k + 1):
+                    gmm = GaussianMixture(n_components=k, random_state=42, n_init=1)
+                    lbls = gmm.fit_predict(scaled_data)
+                    if len(np.unique(lbls)) < 2: continue
+                    score = silhouette_score(scaled_data, lbls)
+                    if score > best_score:
+                        best_k, best_score, best_labels = k, score, lbls
+                if best_labels is not None:
+                    candidates["Gaussian Mixture"] = (best_labels, {"handles_noise": False, "k": best_k})
+        except Exception:
+            pass
+
+        # ── K-Prototypes — ONLY eligible when the data is genuinely mixed/
+        # categorical-heavy (cat_ratio >= 0.3). This is the "context aware"
+        # part of the selection. ──
+        if cat_ratio >= 0.3 and self.cat_mappings:
+            try:
+                from kmodes.kprototypes import KPrototypes
+                from sklearn.preprocessing import StandardScaler as _SS
+
+                raw = sub[feature_cols].copy()
+                cat_idx = [i for i, c in enumerate(feature_cols) if c in self.cat_mappings]
+                num_cols = [c for c in feature_cols if c not in self.cat_mappings]
+                if num_cols:
+                    raw[num_cols] = _SS().fit_transform(raw[num_cols])
+                for c in self.cat_mappings:
+                    raw[c] = raw[c].astype(str)
+
+                best_k, best_score, best_labels = None, -1, None
+                max_k = min(10, max(2, n_rows // 20))
+                for k in range(2, max_k + 1):
+                    try:
+                        kp = KPrototypes(n_clusters=k, init="Huang", random_state=42, n_init=2, verbose=0)
+                        lbls = kp.fit_predict(raw.values, categorical=cat_idx)
+                        if len(np.unique(lbls)) < 2: continue
+                        # Scored on the shared scaled_data, same as every other candidate.
+                        score = silhouette_score(scaled_data, lbls)
+                        if score > best_score:
+                            best_k, best_score, best_labels = k, score, lbls
+                    except Exception:
+                        continue
+                if best_labels is not None:
+                    candidates["K-Prototypes"] = (
+                        best_labels,
+                        {"handles_noise": False, "k": best_k, "native_categorical": True},
+                    )
+            except ImportError:
+                pass  # kmodes not installed — same graceful degradation as the UMAP/HDBSCAN pattern
+
+        if not candidates:
+            return None
+
+        # ── Score every candidate on 3 unsupervised metrics, normalize, combine ──
+        # Cap at a "usable for a human audience" cluster count — a result can be
+        # statistically tighter with many small clusters (confirmed during testing:
+        # HDBSCAN's finest min_cluster_size fraction found 36 clusters on
+        # categorical-heavy data, technically outscoring a 6-cluster result), but
+        # 36 auto-named personas isn't a useful output for a business audience.
+        # None of the unsupervised quality metrics know or care about that — this
+        # cap is what keeps the tournament's answer actually usable downstream.
+        MAX_USABLE_CLUSTERS = 15
+
+        leaderboard = []
+        for name, (labels, extra) in candidates.items():
+            mask = labels != -1   # exclude HDBSCAN noise from quality scoring
+            if mask.sum() < 3 or len(np.unique(labels[mask])) < 2:
+                continue
+            if len(np.unique(labels[mask])) > MAX_USABLE_CLUSTERS:
+                continue
+            try:
+                sil = silhouette_score(scaled_data[mask], labels[mask])
+                db  = davies_bouldin_score(scaled_data[mask], labels[mask])
+                ch  = calinski_harabasz_score(scaled_data[mask], labels[mask])
+            except Exception:
+                continue
+            leaderboard.append({
+                "algorithm": name, "labels": labels, "extra": extra,
+                "silhouette": sil, "davies_bouldin": db, "calinski_harabasz": ch,
+                "n_clusters": len(np.unique(labels[mask])),
+                "noise_count": int((~mask).sum()),
+            })
+
+        if not leaderboard:
+            return None
+
+        sils = [r["silhouette"] for r in leaderboard]
+        dbs  = [r["davies_bouldin"] for r in leaderboard]
+        chs  = [r["calinski_harabasz"] for r in leaderboard]
+
+        def _norm(vals, higher_better=True):
+            lo, hi = min(vals), max(vals)
+            if hi - lo < 1e-9:
+                return [0.5] * len(vals)
+            normed = [(v - lo) / (hi - lo) for v in vals]
+            return normed if higher_better else [1 - v for v in normed]
+
+        n_sil = _norm(sils, True)
+        n_db  = _norm(dbs, False)
+        n_ch  = _norm(chs, True)
+
+        # Weighting: silhouette weighted highest since it's the most widely
+        # understood/interpretable clustering quality metric; Davies-Bouldin
+        # and Calinski-Harabasz split the remainder as corroborating signals.
+        for i, row in enumerate(leaderboard):
+            row["composite_score"] = round(0.4 * n_sil[i] + 0.3 * n_db[i] + 0.3 * n_ch[i], 4)
+
+        leaderboard.sort(key=lambda r: r["composite_score"], reverse=True)
+        for i, row in enumerate(leaderboard):
+            row["selected"] = "✓" if i == 0 else ""
+
+        winner = leaderboard[0]
+        return {
+            "winner_name":   winner["algorithm"],
+            "winner_labels": winner["labels"],
+            "winner_extra":  winner["extra"],
+            "leaderboard": [
+                {
+                    "algorithm":         r["algorithm"],
+                    "silhouette":        round(r["silhouette"], 4),
+                    "davies_bouldin":    round(r["davies_bouldin"], 4),
+                    "calinski_harabasz": round(r["calinski_harabasz"], 2),
+                    "n_clusters":        r["n_clusters"],
+                    "noise_count":       r["noise_count"],
+                    "composite_score":   r["composite_score"],
+                    "selected":          r["selected"],
+                }
+                for r in leaderboard
+            ],
+        }
+
+    def run(self, df, feature_cols, domain_context: str = None):
+        import numpy as np
+        import pandas as pd
         from sklearn.preprocessing import StandardScaler
         from sklearn.ensemble import RandomForestClassifier
         from sklearn.metrics import silhouette_score
 
-        # Attempt to load advanced topological libraries
+        self.feature_cols = feature_cols
+
         try:
             from sklearn.cluster import HDBSCAN
             use_hdbscan = True
@@ -1350,117 +1862,191 @@ class ClusterEngine:
         if len(sub) < 15:
             return {"error": "Need at least 15 rows for clustering."}
 
-        encoded_df   = pd.get_dummies(sub, drop_first=True)
-        encoded_cols = encoded_df.columns.tolist()
-        if len(encoded_cols) < 2:
+        # ── 1. Store category levels BEFORE encoding ───────────────────────────
+        # This is what makes predict_point() work correctly later.
+        self.cat_mappings = {}
+        for col in sub.columns:
+            import pandas.api.types as _pat
+            if _pat.is_string_dtype(sub[col]) or _pat.is_object_dtype(sub[col]) or str(sub[col].dtype) in ("category", "string"):
+                cats = sorted(sub[col].dropna().unique().tolist())
+                if len(cats) >= 2:
+                    self.cat_mappings[col] = cats
+
+        # ── 1b. Store per-feature defaults for graceful partial predictions ────
+        # If a later predict_point() call is missing a field, we impute it
+        # from these training-time defaults (median for numeric, mode for
+        # categorical) rather than hard-failing — see predict_point() for how
+        # this trades off against prediction reliability.
+        self.feature_defaults = {}
+        for col in feature_cols:
+            if col in self.cat_mappings:
+                mode_vals = sub[col].mode(dropna=True)
+                self.feature_defaults[col] = mode_vals.iloc[0] if not mode_vals.empty else None
+            else:
+                try:
+                    self.feature_defaults[col] = float(sub[col].median())
+                except Exception:
+                    self.feature_defaults[col] = None
+
+        # ── 2. Encode training data with consistent helper ─────────────────────
+        # self.encoded_cols is None here, so _encode_consistent falls through
+        # to a plain get_dummies. We capture the column order afterwards.
+        sub_for_enc = sub.copy()
+        for col, cats in self.cat_mappings.items():
+            sub_for_enc[col] = pd.Categorical(sub_for_enc[col], categories=cats)
+        encoded_df = pd.get_dummies(sub_for_enc, drop_first=False)
+
+        self.encoded_cols = encoded_df.columns.tolist()
+
+        if len(self.encoded_cols) < 2:
             return {"error": "Clustering requires at least 2 distinct features."}
 
-        scaler      = StandardScaler()
-        scaled_data = scaler.fit_transform(encoded_df)
+        self.scaler  = StandardScaler()
+        scaled_data  = self.scaler.fit_transform(encoded_df)
 
-        # ── 1. HDBSCAN Core Clustering ──
-        if use_hdbscan:
-            # HDBSCAN auto-tunes k based on density. min_cluster_size dictates group strictness.
-            min_sz = max(5, len(scaled_data) // 15)
-            hdb    = HDBSCAN(min_cluster_size=min_sz)
-            labels = hdb.fit_predict(scaled_data)
-            
-            n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
-            
-            # If HDBSCAN decides everything is just 1 giant blob or everything is noise, fallback to KMeans to force a split
-            if n_clusters < 2:
-                use_hdbscan = False
+        # ── 3. Clustering — context-aware algorithm tournament ─────────────────
+        # Profiles the data and runs a shortlist of eligible algorithms (HDBSCAN,
+        # K-Means, Gaussian Mixture, and K-Prototypes when the data is
+        # categorical-heavy), scored on a composite of 3 unsupervised quality
+        # metrics. Falls back to the old fixed HDBSCAN→K-Means logic only if the
+        # tournament produced nothing usable at all (defensive, should be rare).
+        tournament = self._select_clustering_algorithm(sub, feature_cols, scaled_data, encoded_df)
 
-        # ── Fallback: KMeans + Isolation Forest ──
-        if not use_hdbscan:
-            from sklearn.ensemble import IsolationForest
-            from sklearn.cluster import KMeans
-            iso = IsolationForest(contamination=0.05, random_state=42)
-            is_inlier = iso.fit_predict(scaled_data) == 1
-            if is_inlier.sum() < 10:
-                is_inlier = np.ones(len(sub), dtype=bool)
+        if tournament is not None:
+            labels = tournament["winner_labels"]
+            clust_algo = tournament["winner_name"]
+            n_clusters = len([c for c in set(labels) if c != -1])
+            clustering_leaderboard = tournament["leaderboard"]
+        else:
+            if use_hdbscan:
+                min_sz = max(5, len(scaled_data) // 15)
+                hdb    = HDBSCAN(min_cluster_size=min_sz)
+                labels = hdb.fit_predict(scaled_data)
+                n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
+                if n_clusters < 2:
+                    use_hdbscan = False  # fall through to KMeans
+                else:
+                    clust_algo = "HDBSCAN"
 
-            scaled_normal = scaled_data[is_inlier]
+            if not use_hdbscan:
+                from sklearn.ensemble import IsolationForest
+                from sklearn.cluster import KMeans
+                iso = IsolationForest(contamination=0.05, random_state=42)
+                is_inlier = iso.fit_predict(scaled_data) == 1
+                if is_inlier.sum() < 10:
+                    is_inlier = np.ones(len(sub), dtype=bool)
 
-            max_k = min(12, max(2, len(scaled_normal) // 15))
-            best_k, best_score = 2, -1
-            for k in range(2, max_k + 1):
-                if k >= len(scaled_normal): break
-                km   = KMeans(n_clusters=k, random_state=42, n_init="auto")
-                lbls = km.fit_predict(scaled_normal)
-                if len(np.unique(lbls)) < 2: continue
-                score = silhouette_score(scaled_normal, lbls)
-                if score > best_score:
-                    best_k, best_score = k, score
+                scaled_normal = scaled_data[is_inlier]
+                max_k = min(12, max(2, len(scaled_normal) // 15))
+                best_k, best_score = 2, -1
+                for k in range(2, max_k + 1):
+                    if k >= len(scaled_normal): break
+                    km   = KMeans(n_clusters=k, random_state=42, n_init="auto")
+                    lbls = km.fit_predict(scaled_normal)
+                    if len(np.unique(lbls)) < 2: continue
+                    score = silhouette_score(scaled_normal, lbls)
+                    if score > best_score:
+                        best_k, best_score = k, score
 
-            km = KMeans(n_clusters=best_k, random_state=42, n_init="auto")
-            normal_labels = km.fit_predict(scaled_normal)
+                km = KMeans(n_clusters=best_k, random_state=42, n_init="auto")
+                normal_labels = km.fit_predict(scaled_normal)
+                labels = np.full(len(sub), -1)
+                labels[is_inlier] = normal_labels
+                n_clusters = best_k
+                clust_algo = "K-Means"
 
-            labels = np.full(len(sub), -1)
-            labels[is_inlier] = normal_labels
-            n_clusters = best_k
+            clustering_leaderboard = []
 
-        # ── Labeling & Outlier tracking ──
-        sub["Cluster"]  = [f"Cluster {x}" if x != -1 else "Outlier (Noise)" for x in labels]
-        is_inlier_final = labels != -1
-        n_outliers      = int((~is_inlier_final).sum())
+        sub["Cluster"]      = [f"Cluster {x}" if x != -1 else "Outlier (Noise)" for x in labels]
+        is_inlier_final     = labels != -1
+        n_outliers          = int((~is_inlier_final).sum())
 
-        # Generate a silhouette score purely for the UI KPI metric (excluding noise)
         sil_score = -1.0
         if is_inlier_final.sum() > 2 and n_clusters >= 2:
             try:
-                sil_score = silhouette_score(scaled_data[is_inlier_final], labels[is_inlier_final])
+                sil_score = silhouette_score(
+                    scaled_data[is_inlier_final], labels[is_inlier_final]
+                )
             except Exception:
                 pass
 
-        # ── Explainable AI (Random Forest) ──
-        fi_df = None
+        # ── 4. Feature importance ──────────────────────────────────────────────
+        fi_df      = None
         top_driver = "Unknown"
         if is_inlier_final.sum() > 10 and n_clusters >= 2:
-            rf = RandomForestClassifier(n_estimators=100, max_depth=5, random_state=42)
-            rf.fit(scaled_data[is_inlier_final], labels[is_inlier_final])
+            rf_explainer = RandomForestClassifier(
+                n_estimators=100, max_depth=5, random_state=42
+            )
+            rf_explainer.fit(scaled_data[is_inlier_final], labels[is_inlier_final])
             fi_df = pd.DataFrame({
-                "feature":    encoded_cols,
-                "importance": rf.feature_importances_.round(4),
+                "feature":    self.encoded_cols,
+                "importance": rf_explainer.feature_importances_.round(4),
             }).sort_values(by="importance", ascending=False).head(10)
             top_driver = fi_df.iloc[0]["feature"]
 
-        # ── 2. UMAP Topological Projection ──
+        # ── 5. 2D projection ───────────────────────────────────────────────────
         if use_umap:
-            # Compresses multidimensional data to 2D while preserving neighborhood relationships
-            reducer = UMAP(n_components=2, random_state=42)
-            pca_coords = reducer.fit_transform(scaled_data)
-            algo_name = "UMAP"
+            from umap import UMAP
+            reducer    = UMAP(n_components=2, random_state=42)
+            coords     = reducer.fit_transform(scaled_data)
+            algo_name  = "UMAP"
+            pca_var    = [0.0, 0.0]
         else:
             from sklearn.decomposition import PCA
-            reducer = PCA(n_components=2)
-            pca_coords = reducer.fit_transform(scaled_data)
-            algo_name = "PCA"
+            reducer    = PCA(n_components=2)
+            reducer.fit(scaled_data[is_inlier_final])   # fit on inliers only
+            coords     = reducer.transform(scaled_data)  # transform all
+            algo_name  = "PCA"
+            pca_var    = [round(v, 4) for v in reducer.explained_variance_ratio_.tolist()]
 
-        # UI Chart builder expects "PCA_X" and "PCA_Y" strictly
-        sub["PCA_X"] = pca_coords[:, 0].round(3)
-        sub["PCA_Y"] = pca_coords[:, 1].round(3)
+        sub["PCA_X"] = coords[:, 0].round(3)
+        sub["PCA_Y"] = coords[:, 1].round(3)
 
-        # ── LLM Profiling ──
+        # ── 6. Cluster profiles & LLM labeling ────────────────────────────────
         valid_clusters = sub[sub["Cluster"] != "Outlier (Noise)"]
-        numeric_orig   = valid_clusters.select_dtypes(include=np.number).drop(columns=["PCA_X", "PCA_Y"], errors="ignore")
+        numeric_orig   = valid_clusters.select_dtypes(include=np.number).drop(
+            columns=["PCA_X", "PCA_Y"], errors="ignore"
+        )
         profiles = {}
         if not numeric_orig.empty:
-            profiles = valid_clusters.groupby("Cluster")[numeric_orig.columns].mean().round(2).to_dict("index")
+            profiles = (
+                valid_clusters.groupby("Cluster")[numeric_orig.columns]
+                .mean().round(2).to_dict("index")
+            )
 
-        new_labels = self._generate_labels(profiles)
+        # Two-step naming: compute what's actually DISTINCTIVE about each
+        # cluster (vs. the overall dataset average) before asking Groq to
+        # name it — raw averages alone tend to produce vague names like
+        # "Medium Users". _generate_labels() also still guarantees unique
+        # persona names via _dedupe_labels().
+        distinguishing = self._compute_distinguishing_features(valid_clusters, numeric_orig.columns.tolist())
+        new_labels = self._generate_labels(profiles, distinguishing, domain_context=domain_context)
         if new_labels:
             sub["Cluster"] = sub["Cluster"].map(lambda x: new_labels.get(x, x))
             profiles       = {new_labels.get(k, k): v for k, v in profiles.items()}
 
-        clust_algo = "HDBSCAN" if use_hdbscan else "K-Means"
-        narrative  = (
-            f"Segmented into {n_clusters} distinct personas using {clust_algo} and {algo_name}. "
-            f"{n_outliers} noise/outliers were natively isolated. "
-            f"#1 driving factor: '{top_driver}' (standardized). "
+        self.cluster_profiles = profiles
+        # clust_algo already set above by the tournament (or its fallback) — no overwrite here.
+
+        # ── 7. Production classifier (trained on ALL points incl. noise) ───────
+        # Same tournament philosophy as the clustering algorithm choice above —
+        # compares several classifier types instead of hardcoding Random Forest.
+        clf_tournament = _run_classifier_tournament(scaled_data, sub["Cluster"].values)
+        self.clf = clf_tournament["model"]
+        classifier_winner = clf_tournament["winner"]
+        classifier_leaderboard = clf_tournament["leaderboard"]
+
+        narrative = (
+            f"Segmented into {n_clusters} distinct personas using {clust_algo} + {algo_name} "
+            f"(chosen from {len(clustering_leaderboard) or 1} candidate clustering algorithm(s) "
+            f"by composite quality score). "
+            f"{n_outliers} noise/outliers natively isolated. "
+            f"#1 driving factor: '{top_driver}' (standardized importance). "
+            f"Point-prediction powered by {classifier_winner} "
+            f"(chosen from {len(classifier_leaderboard) or 1} candidate model(s) by weighted F1). "
         )
         for persona_name, prof in profiles.items():
-            top_feat  = ", ".join([f"{k}={v}" for k, v in list(prof.items())[:3]])
+            top_feat   = ", ".join([f"{k}={v}" for k, v in list(prof.items())[:3]])
             narrative += f"**{persona_name}**: {top_feat}. "
 
         meta = {
@@ -1473,11 +2059,511 @@ class ClusterEngine:
             "outlier_count": n_outliers,
             "algorithm":     clust_algo,
             "reduction":     algo_name,
+            "pca_variance":  pca_var,
+            "fi_note":       "Importance scores are on the standardized (z-score) feature scale.",
+            "cat_mappings":  {k: v for k, v in self.cat_mappings.items()},  # expose for debugging
+            "distinguishing_features": distinguishing,  # what made each persona name what it is
+            "clustering_leaderboard":  clustering_leaderboard,   # algorithm tournament results
+            "classifier_model":       classifier_winner,
+            "classifier_leaderboard": classifier_leaderboard,    # point-classifier tournament results
         }
-        
-        if not use_umap:
-            meta["pca_variance"] = [round(v, 4) for v in reducer.explained_variance_ratio_.tolist()]
-        else:
-            meta["pca_variance"] = [0.0, 0.0]
 
         return {"data": sub, "meta": meta, "feature_importance": fi_df}
+
+    # ── predict_point() ────────────────────────────────────────────────────────
+
+    def predict_point(self, point_dict: dict, allow_partial: bool = True) -> dict:
+        """
+        Classify a new data point into one of the established personas.
+
+        Uses _encode_consistent() which applies the stored category levels
+        so every categorical column is encoded identically to training time.
+        This is what fixes the rural/urban collision bug.
+
+        If `allow_partial` is True (default) and the caller omits some
+        trained features, those are imputed from training-time defaults
+        (median for numeric, mode for categorical) rather than hard-failing.
+        This trades prediction reliability for convenience — the response
+        includes a `defaulted_fields` list and `warning` string whenever this
+        happens, so callers can decide how much to trust the result. Set
+        `allow_partial=False` to restore the old strict "error on any missing
+        field" behavior.
+        """
+        import pandas as pd
+
+        if self.clf is None or self.scaler is None:
+            return {
+                "error": (
+                    "The clustering engine must be run on a base dataset "
+                    "before classifying individual points."
+                )
+            }
+
+        missing = [c for c in self.feature_cols if c not in point_dict]
+        defaulted_fields = []
+
+        if missing:
+            if not allow_partial:
+                return {"error": f"Missing required fields: {missing}"}
+
+            point_dict = dict(point_dict)  # don't mutate the caller's dict
+            still_missing = []
+            for col in missing:
+                default_val = self.feature_defaults.get(col)
+                if default_val is None:
+                    still_missing.append(col)
+                else:
+                    point_dict[col] = default_val
+                    defaulted_fields.append(col)
+
+            if still_missing:
+                return {"error": f"Missing required fields with no available default: {still_missing}"}
+
+        # Build a single-row DataFrame, then encode using stored categories
+        input_df     = pd.DataFrame([point_dict])
+        encoded_pt   = self._encode_consistent(input_df)   # handles drop_first=False + alignment
+        scaled_pt    = self.scaler.transform(encoded_pt)
+
+        predicted_persona = self.clf.predict(scaled_pt)[0]
+        probabilities     = self.clf.predict_proba(scaled_pt)[0]
+        classes           = self.clf.classes_
+
+        confidence_scores  = {
+            cls: round(float(prob), 4)
+            for cls, prob in zip(classes, probabilities)
+        }
+        match_confidence = round(float(max(probabilities)), 4)
+
+        result = {
+            "assigned_persona":  predicted_persona,
+            "match_confidence":  match_confidence,
+            "confidence_matrix": confidence_scores,
+        }
+
+        if defaulted_fields:
+            result["defaulted_fields"] = defaulted_fields
+            result["warning"] = (
+                f"These fields weren't specified and were defaulted to typical training values: "
+                f"{', '.join(defaulted_fields)}. Treat this prediction with lower confidence, since "
+                f"it's based on incomplete information."
+            )
+
+        return result
+
+    # ── predict_point_from_text() ──────────────────────────────────────────────
+
+    def predict_point_from_text(self, question: str) -> dict:
+        """Extract features from natural language, then classify."""
+        if self.clf is None or self.scaler is None:
+            return {
+                "error": (
+                    "I need to cluster your data first before I can classify "
+                    "individual users. Try asking me to segment the data first!"
+                )
+            }
+
+        import json
+        client = self._get_groq_client()
+        if client is None:
+            return {
+                "error": "Groq API key required for natural language feature extraction."
+            }
+
+        # Tell the LLM what types each feature expects
+        feature_type_hints = []
+        for col in self.feature_cols:
+            if col in self.cat_mappings:
+                opts = ", ".join(self.cat_mappings[col])
+                feature_type_hints.append(f"'{col}' (categorical, one of: {opts})")
+            else:
+                feature_type_hints.append(f"'{col}' (numeric)")
+
+        prompt = (
+            "You are a strict data extraction tool.\n"
+            f"Extract the attributes from this query: '{question}'.\n"
+            f"Expected features: {', '.join(feature_type_hints)}.\n"
+            "Rules:\n"
+            "- For categorical features, return the EXACT string value (e.g. 'rural', 'urban').\n"
+            "- For numeric features, return a number.\n"
+            "- If a feature is missing from the query, return null.\n"
+            "Return ONLY a valid JSON object with the feature names as keys. "
+            "No markdown, no explanation."
+        )
+
+        try:
+            resp = client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.0,
+                response_format={"type": "json_object"},
+            )
+            point_dict = json.loads(resp.choices[0].message.content.strip())
+
+            # Remove null values — predict_point handles missing feature check
+            point_dict = {k: v for k, v in point_dict.items() if v is not None}
+
+            prediction = self.predict_point(point_dict)
+            if "error" not in prediction:
+                prediction["extracted_features"] = point_dict
+            return prediction
+
+        except Exception as e:
+            return {"error": f"Failed to extract features from text: {str(e)}"}
+
+
+# ── Supervised Classifier Engine ────────────────────────────────────────────────
+
+class SupervisedClassifierEngine:
+    """
+    Trains a classifier against a REAL label column already present in the
+    user's data (e.g. "Risk_Tier", "Churn_Status", "Approval_Outcome") — as
+    opposed to ClusterEngine, which DISCOVERS groups with no ground truth.
+
+    Use this when the user has labeled historical data and wants to predict
+    that same label for new, unlabeled records. Use ClusterEngine when there
+    is no existing label and the goal is to find natural groupings.
+
+    Mirrors ClusterEngine's session-scoped state pattern (trained model lives
+    on the instance, so each session/label-column needs its own instance —
+    see main.py's per-session `classifiers` dict).
+    """
+
+    def __init__(self):
+        self._groq_client       = None
+        self.scaler             = None
+        self.encoded_cols       = None   # column order the model was trained on
+        self.feature_cols       = None   # original feature columns requested
+        self.label_col          = None   # the real label column being predicted
+        self.cat_mappings       = {}     # {col: [sorted list of all categories]}
+        self.clf                = None   # trained classifier
+        self.classes_           = None
+        self.label_distribution = None
+        self.feature_defaults   = {}   # {col: median (numeric) or mode (categorical)} — used to
+                                        # impute missing fields in predict_point() rather than hard-fail
+
+    # ── Groq lazy init (same pattern as ClusterEngine) ──────────────────────────
+
+    def _get_groq_client(self):
+        if self._groq_client is not None:
+            return self._groq_client
+        try:
+            import os
+            from groq import Groq
+            key = os.getenv("GROQ_API_KEY")
+            if not key:
+                return None
+            self._groq_client = Groq(api_key=key)
+            return self._groq_client
+        except Exception:
+            return None
+
+    # ── Consistent encoding helper (same mechanism as ClusterEngine) ────────────
+
+    def _encode_consistent(self, df_in: "pd.DataFrame") -> "pd.DataFrame":
+        import pandas as pd
+        df_copy = df_in.copy()
+
+        for col, cats in self.cat_mappings.items():
+            if col in df_copy.columns:
+                df_copy[col] = pd.Categorical(df_copy[col].astype(str), categories=cats)
+
+        encoded = pd.get_dummies(df_copy, drop_first=False)
+
+        if self.encoded_cols is not None:
+            final = pd.DataFrame(0, index=df_copy.index, columns=self.encoded_cols)
+            for col in self.encoded_cols:
+                if col in encoded.columns:
+                    final[col] = encoded[col].values
+            return final
+
+        return encoded
+
+    # ── run() — train against a real label column ───────────────────────────────
+
+    def run(self, df, feature_cols, label_col):
+        import numpy as np
+        import pandas as pd
+        import pandas.api.types as _pat
+        from sklearn.preprocessing import StandardScaler
+        from sklearn.ensemble import RandomForestClassifier
+        from sklearn.model_selection import train_test_split
+        from sklearn.metrics import accuracy_score, f1_score, confusion_matrix
+
+        missing = [c for c in feature_cols + [label_col] if c not in df.columns]
+        if missing:
+            return {"error": f"Columns not found: {missing}"}
+
+        self.feature_cols = feature_cols
+        self.label_col    = label_col
+
+        sub = df[feature_cols + [label_col]].copy().dropna()
+        if len(sub) < 20:
+            return {"error": "Need at least 20 rows to train a supervised classifier."}
+
+        n_classes = sub[label_col].nunique()
+        if n_classes < 2:
+            return {"error": f"Label column '{label_col}' has only {n_classes} distinct value — need at least 2 classes to classify."}
+        if n_classes > 20:
+            return {
+                "error": (
+                    f"Label column '{label_col}' has {n_classes} distinct values — unusually high for "
+                    "classification. If this is a continuous/numeric target, use Regression instead; "
+                    "if it's meant to be categorical, consider grouping it into fewer categories first."
+                )
+            }
+
+        y_raw = sub[label_col].astype(str)
+        self.label_distribution = y_raw.value_counts().to_dict()
+
+        X_df = sub[feature_cols].copy()
+
+        # Store category levels for feature columns — same mechanism as
+        # ClusterEngine, needed so a single-row prediction later encodes
+        # identically to how training data was encoded.
+        self.cat_mappings = {}
+        for col in X_df.columns:
+            if not _pat.is_numeric_dtype(X_df[col]):
+                X_df[col] = X_df[col].astype(str)
+                cats = sorted(X_df[col].dropna().unique().tolist())
+                if len(cats) >= 2:
+                    self.cat_mappings[col] = cats
+
+        # Store per-feature defaults for graceful partial predictions — see
+        # ClusterEngine.predict_point() for the identical rationale/mechanism.
+        self.feature_defaults = {}
+        for col in feature_cols:
+            if col in self.cat_mappings:
+                mode_vals = X_df[col].mode(dropna=True)
+                self.feature_defaults[col] = mode_vals.iloc[0] if not mode_vals.empty else None
+            else:
+                try:
+                    self.feature_defaults[col] = float(X_df[col].median())
+                except Exception:
+                    self.feature_defaults[col] = None
+
+        X_for_enc = X_df.copy()
+        for col, cats in self.cat_mappings.items():
+            X_for_enc[col] = pd.Categorical(X_for_enc[col], categories=cats)
+        encoded_df = pd.get_dummies(X_for_enc, drop_first=False)
+        self.encoded_cols = encoded_df.columns.tolist()
+
+        if len(self.encoded_cols) < 1:
+            return {"error": "No usable feature columns after encoding."}
+
+        self.scaler = StandardScaler()
+        X_scaled = self.scaler.fit_transform(encoded_df)
+
+        # Stratify when feasible (every class needs enough rows for a test split)
+        min_class_count = y_raw.value_counts().min()
+        stratify = y_raw if min_class_count >= 2 else None
+
+        X_train, X_test, y_train, y_test = train_test_split(
+            X_scaled, y_raw, test_size=0.2, random_state=42, stratify=stratify
+        )
+
+        # Model tournament — compares Random Forest, Gradient Boosting, Extra
+        # Trees, Logistic Regression, and KNN via CV on the TRAIN split only,
+        # so the held-out X_test/y_test below stays untouched for an honest
+        # final accuracy/F1 report. Same helper ClusterEngine's point-classifier
+        # uses — see _run_classifier_tournament for the full rationale.
+        train_tournament = _run_classifier_tournament(X_train, y_train)
+        eval_model = train_tournament["model"]   # fit on X_train only
+        classifier_leaderboard = train_tournament["leaderboard"]
+        classifier_winner = train_tournament["winner"]
+
+        preds    = eval_model.predict(X_test)
+        accuracy = accuracy_score(y_test, preds)
+        f1       = f1_score(y_test, preds, average="weighted")
+        classes_sorted = sorted(y_raw.unique().tolist())
+        cm       = confusion_matrix(y_test, preds, labels=classes_sorted)
+
+        # Feature importance: only tree-based winners expose feature_importances_
+        # directly; Logistic Regression exposes coefficients instead (used as an
+        # importance proxy via mean absolute magnitude); KNN exposes neither, so
+        # feature importance is simply omitted rather than fabricated for it.
+        if hasattr(eval_model, "feature_importances_"):
+            importances = eval_model.feature_importances_
+        elif hasattr(eval_model, "coef_"):
+            importances = np.abs(eval_model.coef_).mean(axis=0)
+        else:
+            importances = None
+
+        if importances is not None:
+            total = importances.sum()
+            fi_df = pd.DataFrame({
+                "feature":    self.encoded_cols,
+                "importance": np.round(importances / total, 4) if total > 0 else np.round(importances, 4),
+            }).sort_values("importance", ascending=False).head(10)
+        else:
+            fi_df = pd.DataFrame(columns=["feature", "importance"])
+
+        # Refit the SAME winning algorithm type on ALL available data (train+test
+        # combined) for the production model used by predict_point() — re-running
+        # the tournament on the full dataset rather than just refitting the
+        # train-split winner, since the best-performing algorithm CAN differ once
+        # more data is available; the held-out metrics above remain the honest
+        # report regardless of what the full-data tournament picks.
+        full_tournament = _run_classifier_tournament(X_scaled, y_raw)
+        self.clf = full_tournament["model"]
+        self.classes_ = sorted(self.clf.classes_.tolist())
+
+        comparison = pd.DataFrame({
+            "actual":    y_test.values,
+            "predicted": preds,
+            "correct":   (y_test.values == preds),
+        })
+
+        top_feature = fi_df.iloc[0]["feature"] if not fi_df.empty else "Unknown"
+        narrative = (
+            f"Compared {len(classifier_leaderboard) or 1} classifier model(s) to predict **{label_col}** "
+            f"from {len(feature_cols)} feature(s) across {n_classes} classes — **{classifier_winner}** won "
+            f"on weighted F1. Held-out accuracy: **{accuracy*100:.1f}%**, "
+            f"weighted F1: **{f1:.3f}**. Top predictive feature: **{top_feature}**."
+        )
+
+        return {
+            "data": comparison,
+            "meta": {
+                "label_col":              label_col,
+                "feature_cols":           feature_cols,
+                "classes":                classes_sorted,
+                "n_classes":              n_classes,
+                "accuracy":               round(float(accuracy), 4),
+                "f1_weighted":            round(float(f1), 4),
+                "confusion_matrix":       cm.tolist(),
+                "label_distribution":     self.label_distribution,
+                "narrative":              narrative,
+                "classifier_model":       classifier_winner,
+                "classifier_leaderboard": classifier_leaderboard,
+            },
+            "feature_importance": fi_df,
+        }
+
+
+    # ── predict_point() ────────────────────────────────────────────────────────
+
+    def predict_point(self, point_dict: dict, allow_partial: bool = True) -> dict:
+        """
+        Same imputation mechanism as ClusterEngine.predict_point() — see that
+        method's docstring for the full rationale. Missing trained features
+        are filled from training-time defaults (median/mode) by default
+        rather than hard-failing, with a `defaulted_fields`/`warning` in the
+        response when this happens. Pass allow_partial=False to restore the
+        strict "error on any missing field" behavior.
+        """
+        import pandas as pd
+
+        if self.clf is None or self.scaler is None:
+            return {
+                "error": (
+                    f"No trained classifier available for label '{self.label_col}'. "
+                    "Train one first by asking a classification question against labeled data."
+                )
+            }
+
+        missing = [c for c in self.feature_cols if c not in point_dict]
+        defaulted_fields = []
+
+        if missing:
+            if not allow_partial:
+                return {"error": f"Missing required fields: {missing}"}
+
+            point_dict = dict(point_dict)
+            still_missing = []
+            for col in missing:
+                default_val = self.feature_defaults.get(col)
+                if default_val is None:
+                    still_missing.append(col)
+                else:
+                    point_dict[col] = default_val
+                    defaulted_fields.append(col)
+
+            if still_missing:
+                return {"error": f"Missing required fields with no available default: {still_missing}"}
+
+        input_df   = pd.DataFrame([point_dict])
+        encoded_pt = self._encode_consistent(input_df)
+        scaled_pt  = self.scaler.transform(encoded_pt)
+
+        predicted_label = self.clf.predict(scaled_pt)[0]
+        probabilities   = self.clf.predict_proba(scaled_pt)[0]
+        classes         = self.clf.classes_
+
+        confidence_scores = {
+            cls: round(float(prob), 4)
+            for cls, prob in zip(classes, probabilities)
+        }
+        match_confidence = round(float(max(probabilities)), 4)
+
+        result = {
+            "predicted_label":   predicted_label,
+            "label_col":         self.label_col,
+            "match_confidence":  match_confidence,
+            "confidence_matrix": confidence_scores,
+        }
+
+        if defaulted_fields:
+            result["defaulted_fields"] = defaulted_fields
+            result["warning"] = (
+                f"These fields weren't specified and were defaulted to typical training values: "
+                f"{', '.join(defaulted_fields)}. Treat this prediction with lower confidence, since "
+                f"it's based on incomplete information."
+            )
+
+        return result
+
+    # ── predict_point_from_text() ──────────────────────────────────────────────
+
+    def predict_point_from_text(self, question: str) -> dict:
+        """Extract features from natural language, then classify against the
+        trained label. Mirrors ClusterEngine.predict_point_from_text()."""
+        if self.clf is None or self.scaler is None:
+            return {
+                "error": (
+                    f"I need to train a classifier for '{self.label_col}' on labeled data first. "
+                    "Try asking a classification question before predicting individual records!"
+                )
+            }
+
+        import json
+        client = self._get_groq_client()
+        if client is None:
+            return {"error": "Groq API key required for natural language feature extraction."}
+
+        feature_type_hints = []
+        for col in self.feature_cols:
+            if col in self.cat_mappings:
+                opts = ", ".join(self.cat_mappings[col])
+                feature_type_hints.append(f"'{col}' (categorical, one of: {opts})")
+            else:
+                feature_type_hints.append(f"'{col}' (numeric)")
+
+        prompt = (
+            "You are a strict data extraction tool.\n"
+            f"Extract the attributes from this query: '{question}'.\n"
+            f"Expected features: {', '.join(feature_type_hints)}.\n"
+            "Rules:\n"
+            "- For categorical features, return the EXACT string value.\n"
+            "- For numeric features, return a number.\n"
+            "- If a feature is missing from the query, return null.\n"
+            "Return ONLY a valid JSON object with the feature names as keys. "
+            "No markdown, no explanation."
+        )
+
+        try:
+            resp = client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.0,
+                response_format={"type": "json_object"},
+            )
+            point_dict = json.loads(resp.choices[0].message.content.strip())
+            point_dict = {k: v for k, v in point_dict.items() if v is not None}
+
+            prediction = self.predict_point(point_dict)
+            if "error" not in prediction:
+                prediction["extracted_features"] = point_dict
+            return prediction
+
+        except Exception as e:
+            return {"error": f"Failed to extract features from text: {str(e)}"}

@@ -4,16 +4,18 @@ import ExportMenu  from "./ExportMenu"
 import axios       from "axios"
 import { API_BASE } from "../config"
 
-const INTENT_ICONS = { sql: "⊟", forecast: "↗", regression: "⎇", trend: "∿", anomaly: "⚡", summary: "◈" }
-const INTENT_COLORS = { sql: "#6366F1", forecast: "#F59E0B", regression: "#10B981", trend: "#06B6D4", anomaly: "#F43F5E", summary: "#8B5CF6" }
+const INTENT_ICONS = { sql: "⊟", forecast: "↗", regression: "⎇", trend: "∿", anomaly: "⚡", summary: "◈", clustering: "◍", classification: "🏷" }
+const INTENT_COLORS = { sql: "#6366F1", forecast: "#F59E0B", regression: "#10B981", trend: "#06B6D4", anomaly: "#F43F5E", summary: "#8B5CF6", clustering: "#8B5CF6", classification: "#0EA5E9" }
 
 const FOLLOWUPS = {
-  sql:        ["Show trend over time", "Forecast next 3 months", "Break down by region", "Sort descending"],
-  forecast:   ["Extend forecast to 24 months", "Compare by segment", "Show historical only", "Detect anomalies"],
-  trend:      ["Forecast next 6 months", "Compare by group", "Detect anomalies in this data", "Show raw numbers"],
-  anomaly:    ["Show trend excluding anomalies", "Which dates had the most anomalies?", "Compare by category"],
-  regression: ["Show top feature drivers", "Compare actual vs predicted", "Run forecast instead"],
-  summary:    ["Show sales trend", "Which region performs best?", "Detect anomalies"],
+  sql:            ["Show trend over time", "Forecast next 3 months", "Break down by region", "Sort descending"],
+  forecast:       ["Extend forecast to 24 months", "Compare by segment", "Show historical only", "Detect anomalies"],
+  trend:          ["Forecast next 6 months", "Compare by group", "Detect anomalies in this data", "Show raw numbers"],
+  anomaly:        ["Show trend excluding anomalies", "Which dates had the most anomalies?", "Compare by category"],
+  regression:     ["Show top feature drivers", "Compare actual vs predicted", "Run forecast instead"],
+  summary:        ["Show sales trend", "Which region performs best?", "Detect anomalies"],
+  clustering:     ["Segment by different features", "Which cluster would a new record belong to?", "Show cluster breakdown"],
+  classification: ["Show confusion matrix breakdown", "Which features matter most?", "Classify a new record", "Show class distribution"],
 }
 
 export default function ResultPanel({ result, sessionId, onFollowUp }) {
@@ -171,6 +173,153 @@ export default function ResultPanel({ result, sessionId, onFollowUp }) {
                       {result.primary_metric === "RMSE" && " (High volatility detected in historical data)"}
                       {result.primary_metric === "SMAPE" && " (Standard scale-independent metric)"}
                     </p>
+                  </div>
+                )}
+
+                {/* Clustering algorithm tournament — which algorithm won and why */}
+                {result.type === "clustering" && result.clustering_leaderboard?.length > 0 && (
+                  <div className="forecast-leaderboard" style={{ marginTop: "24px", background: "#f8fafc", padding: "16px", borderRadius: "8px", border: "1px solid #e2e8f0" }}>
+                    <h4 style={{ margin: "0 0 12px 0", color: "#0f172a", fontSize: "14px" }}>
+                      🧪 Clustering Algorithm Tournament — composite quality score
+                    </h4>
+                    <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "13px", textAlign: "left" }}>
+                      <thead>
+                        <tr style={{ borderBottom: "2px solid #cbd5e1", color: "#64748b" }}>
+                          <th style={{ padding: "8px" }}>Algorithm</th>
+                          <th style={{ padding: "8px" }}>Silhouette</th>
+                          <th style={{ padding: "8px" }}>Davies-Bouldin</th>
+                          <th style={{ padding: "8px" }}>Calinski-Harabasz</th>
+                          <th style={{ padding: "8px" }}>Clusters</th>
+                          <th style={{ padding: "8px" }}>Status</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {result.clustering_leaderboard.map((row, i) => (
+                          <tr key={i} style={{
+                            borderBottom: "1px solid #e2e8f0",
+                            background: row.selected === "✓" ? "rgba(139, 92, 246, 0.1)" : "transparent",
+                            fontWeight: row.selected === "✓" ? "600" : "400"
+                          }}>
+                            <td style={{ padding: "10px 8px", color: "#0f172a" }}>{row.algorithm}</td>
+                            <td style={{ padding: "10px 8px" }}>{row.silhouette}</td>
+                            <td style={{ padding: "10px 8px" }}>{row.davies_bouldin}</td>
+                            <td style={{ padding: "10px 8px" }}>{row.calinski_harabasz}</td>
+                            <td style={{ padding: "10px 8px" }}>{row.n_clusters}{row.noise_count > 0 ? ` (+${row.noise_count} noise)` : ""}</td>
+                            <td style={{ padding: "10px 8px", color: row.selected === "✓" ? "#7C3AED" : "#94a3b8" }}>
+                              {row.selected === "✓" ? "Winner" : "Considered"}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                    <p style={{ margin: "12px 0 0 0", fontSize: "11px", color: "#64748b", fontStyle: "italic" }}>
+                      Chosen by a composite of Silhouette (40%), Davies-Bouldin (30%), and Calinski-Harabasz (30%) — not a single metric alone.
+                    </p>
+                  </div>
+                )}
+
+                {/* Point-classifier tournament (powers predict_point for this cluster model) */}
+                {result.type === "clustering" && result.classifier_leaderboard?.length > 0 && (
+                  <div className="forecast-leaderboard" style={{ marginTop: "16px", background: "#f8fafc", padding: "16px", borderRadius: "8px", border: "1px solid #e2e8f0" }}>
+                    <h4 style={{ margin: "0 0 12px 0", color: "#0f172a", fontSize: "14px" }}>
+                      🎯 Point-Classifier Tournament — {result.classifier_model} selected
+                    </h4>
+                    <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "13px", textAlign: "left" }}>
+                      <thead>
+                        <tr style={{ borderBottom: "2px solid #cbd5e1", color: "#64748b" }}>
+                          <th style={{ padding: "8px" }}>Model</th>
+                          <th style={{ padding: "8px" }}>F1 (weighted)</th>
+                          <th style={{ padding: "8px" }}>Accuracy</th>
+                          <th style={{ padding: "8px" }}>Log-Loss</th>
+                          <th style={{ padding: "8px" }}>Status</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {result.classifier_leaderboard.map((row, i) => (
+                          <tr key={i} style={{
+                            borderBottom: "1px solid #e2e8f0",
+                            background: row.selected === "✓" ? "rgba(14, 165, 233, 0.1)" : "transparent",
+                            fontWeight: row.selected === "✓" ? "600" : "400"
+                          }}>
+                            <td style={{ padding: "10px 8px", color: "#0f172a" }}>{row.model}</td>
+                            <td style={{ padding: "10px 8px" }}>{row.f1_weighted}</td>
+                            <td style={{ padding: "10px 8px" }}>{row.accuracy}</td>
+                            <td style={{ padding: "10px 8px" }}>{row.log_loss ?? "—"}</td>
+                            <td style={{ padding: "10px 8px", color: row.selected === "✓" ? "#0369A1" : "#94a3b8" }}>
+                              {row.selected === "✓" ? "Winner" : "Considered"}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                    <p style={{ margin: "12px 0 0 0", fontSize: "11px", color: "#64748b", fontStyle: "italic" }}>
+                      Lower log-loss means better-calibrated confidence scores — a model can have decent accuracy but still be overconfident or underconfident.
+                    </p>
+                  </div>
+                )}
+
+                {/* Supervised classification model tournament */}
+                {result.type === "classification" && result.classifier_leaderboard?.length > 0 && (
+                  <div className="forecast-leaderboard" style={{ marginTop: "24px", background: "#f8fafc", padding: "16px", borderRadius: "8px", border: "1px solid #e2e8f0" }}>
+                    <h4 style={{ margin: "0 0 12px 0", color: "#0f172a", fontSize: "14px" }}>
+                      🎯 Classifier Tournament — {result.metrics?.Model} selected
+                    </h4>
+                    <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "13px", textAlign: "left" }}>
+                      <thead>
+                        <tr style={{ borderBottom: "2px solid #cbd5e1", color: "#64748b" }}>
+                          <th style={{ padding: "8px" }}>Model</th>
+                          <th style={{ padding: "8px" }}>F1 (weighted)</th>
+                          <th style={{ padding: "8px" }}>Accuracy</th>
+                          <th style={{ padding: "8px" }}>Log-Loss</th>
+                          <th style={{ padding: "8px" }}>Status</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {result.classifier_leaderboard.map((row, i) => (
+                          <tr key={i} style={{
+                            borderBottom: "1px solid #e2e8f0",
+                            background: row.selected === "✓" ? "rgba(14, 165, 233, 0.1)" : "transparent",
+                            fontWeight: row.selected === "✓" ? "600" : "400"
+                          }}>
+                            <td style={{ padding: "10px 8px", color: "#0f172a" }}>{row.model}</td>
+                            <td style={{ padding: "10px 8px" }}>{row.f1_weighted}</td>
+                            <td style={{ padding: "10px 8px" }}>{row.accuracy}</td>
+                            <td style={{ padding: "10px 8px" }}>{row.log_loss ?? "—"}</td>
+                            <td style={{ padding: "10px 8px", color: row.selected === "✓" ? "#0369A1" : "#94a3b8" }}>
+                              {row.selected === "✓" ? "Winner" : "Considered"}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                    <p style={{ margin: "12px 0 0 0", fontSize: "11px", color: "#64748b", fontStyle: "italic" }}>
+                      Selected by weighted F1 on held-out cross-validation, not just raw accuracy — more robust to class imbalance.
+                    </p>
+                  </div>
+                )}
+
+                {/* Classification: class distribution, shown alongside the confusion-matrix chart on the Chart tab */}
+                {result.type === "classification" && result.label_distribution && (
+                  <div className="forecast-leaderboard" style={{ marginTop: "24px", background: "#f8fafc", padding: "16px", borderRadius: "8px", border: "1px solid #e2e8f0" }}>
+                    <h4 style={{ margin: "0 0 12px 0", color: "#0f172a", fontSize: "14px" }}>
+                      🏷 Class Distribution — {result.metrics?.["Label Column"]}
+                    </h4>
+                    <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "13px", textAlign: "left" }}>
+                      <thead>
+                        <tr style={{ borderBottom: "2px solid #cbd5e1", color: "#64748b" }}>
+                          <th style={{ padding: "8px" }}>Class</th>
+                          <th style={{ padding: "8px" }}>Row Count</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {Object.entries(result.label_distribution).map(([cls, count]) => (
+                          <tr key={cls} style={{ borderBottom: "1px solid #e2e8f0" }}>
+                            <td style={{ padding: "10px 8px", color: "#0f172a" }}>{cls}</td>
+                            <td style={{ padding: "10px 8px" }}>{count.toLocaleString()}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
                   </div>
                 )}
                 

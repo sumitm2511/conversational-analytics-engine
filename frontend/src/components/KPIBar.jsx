@@ -32,47 +32,66 @@ function AnimatedNumber({ target }) {
 export default function KPIBar({ schema }) {
   if (!schema) return null
 
-  const totalRows    = Object.values(schema.table_details || {})
-    .reduce((sum, t) => sum + (t.rows || 0), 0)
-  const totalCols    = Object.values(schema.table_details || {})
-    .reduce((sum, t) => sum + (t.columns?.length || 0), 0)
-  const totalTables  = Object.keys(schema.table_details || {}).length
+  const tableDetails = Object.values(schema.table_details || {})
 
-  // Calculate data health based on dtypes presence
-  const allCols = Object.values(schema.table_details || {})
-    .flatMap(t => t.columns || [])
-  const health = allCols.length > 0
-    ? Math.round((allCols.filter(c => c).length / allCols.length) * 100 * 10) / 10
-    : 100
+  const totalRows   = tableDetails.reduce((sum, t) => sum + (t.rows || 0), 0)
+  const totalCols   = tableDetails.reduce((sum, t) => sum + (t.columns?.length || 0), 0)
+  const totalTables = tableDetails.length
 
-  const healthClass = health >= 90 ? "health-good"
+  // Real data health, computed backend-side per table (nulls + duplicates).
+  // Multi-sheet uploads get averaged across tables rather than only
+  // reflecting the first/active sheet.
+  const healthScores = tableDetails
+    .map(t => t.health?.score)
+    .filter(s => s != null)
+
+  const health = healthScores.length
+    ? Math.round((healthScores.reduce((a, b) => a + b, 0) / healthScores.length) * 10) / 10
+    : null   // unknown, not a fake 100 — backend hasn't sent health data
+
+  const healthClass = health == null ? ""
+    : health >= 90 ? "health-good"
     : health >= 70 ? "health-warn" : "health-bad"
+
+  const allWarnings = tableDetails.flatMap(t => t.health?.warnings || [])
 
   const kpis = [
     { icon: "☰", label: "Total Rows",  value: totalRows.toLocaleString(), raw: totalRows },
     { icon: "⊞", label: "Columns",     value: totalCols, raw: totalCols },
     { icon: "⊟", label: "Tables",      value: totalTables, raw: totalTables },
-    { icon: "⬡", label: "Data Health", value: `${health}%`, raw: health,
+    { icon: "⬡", label: "Data Health",
+      value: health == null ? "—" : `${health}%`,
+      raw: health,
       cls: healthClass },
   ]
 
   return (
-    <div className="kpi-bar">
-      {kpis.map((k) => (
-        <div key={k.label} className="kpi-card">
-          <div className="kpi-top">
-            <span className="kpi-icon">{k.icon}</span>
-            <span className="kpi-label">{k.label}</span>
+    <>
+      <div className="kpi-bar">
+        {kpis.map((k) => (
+          <div key={k.label} className="kpi-card">
+            <div className="kpi-top">
+              <span className="kpi-icon">{k.icon}</span>
+              <span className="kpi-label">{k.label}</span>
+            </div>
+            <div className={`kpi-value ${k.cls || ""}`}>
+              {k.label === "Data Health"
+                ? k.value
+                : <AnimatedNumber target={k.raw} />
+              }
+            </div>
           </div>
-          <div className={`kpi-value ${k.cls || ""}`}>
-            {k.label === "Data Health"
-              ? k.value
-              : <AnimatedNumber target={k.raw} />
-            }
-            {k.label === "Data Health" ? "" : ""}
-          </div>
+        ))}
+      </div>
+
+      {allWarnings.length > 0 && (
+        <div className="health-warnings-container">
+          <div className="health-warnings-title">Data Health Warnings</div>
+          {allWarnings.map((w, i) => (
+            <div key={i} className="health-warning-item">⚠ {w}</div>
+          ))}
         </div>
-      ))}
-    </div>
+      )}
+    </>
   )
 }

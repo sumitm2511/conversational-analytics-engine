@@ -14,8 +14,7 @@ const SUGGESTIONS = [
 const ChatPanel = forwardRef(function ChatPanel(
   { sessionId, disabled, onResult, onLoading }, ref
 ) {
-  const [input,     setInput]     = useState("")
-  const [chartType, setChartType] = useState("auto")
+  const [input, setInput] = useState("")
 
   useImperativeHandle(ref, () => ({
     setQuestion: (q) => { setInput(q) }
@@ -31,7 +30,7 @@ const ChatPanel = forwardRef(function ChatPanel(
     try {
       const { data } = await axios.post(
         `${API_BASE}/query/${sessionId}`,
-        { question: q, chart_type: chartType }
+        { question: q }
       )
       onResult({ question: q, ...data })
     } catch (e) {
@@ -60,21 +59,6 @@ const ChatPanel = forwardRef(function ChatPanel(
       </div>
 
       <div className="chat-bar">
-        <select
-          className="chart-select"
-          value={chartType}
-          onChange={e => setChartType(e.target.value)}
-          disabled={disabled}
-        >
-          <option value="auto">⊞ Auto</option>
-          <option value="bar">📊 Bar</option>
-          <option value="line">📈 Line</option>
-          <option value="area">〰 Area</option>
-          <option value="pie">🥧 Pie</option>
-          <option value="scatter">⊙ Scatter</option>
-          <option value="histogram">▦ Histogram</option>
-        </select>
-
         <input
           className="chat-input"
           value={input}

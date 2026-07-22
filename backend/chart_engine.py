@@ -25,8 +25,8 @@ class ChartEngine:
         return "bar"
 
     def _get_colors(self):
-        # A beautiful, distinct color palette for multiple lines
-        return ["#6366F1", "#10B981", "#F43F5E", "#F59E0B", "#06B6D4", "#8B5CF6", "#3B82F6", "#EC4899"]
+        # A beautiful, distinct color palette for multiple lines/clusters
+        return ["#6366F1", "#10B981", "#F43F5E", "#F59E0B", "#06B6D4", "#8B5CF6", "#3B82F6", "#EC4899", "#84CC16", "#14B8A6"]
 
     def _base_layout(self, extra: dict = None) -> dict:
         layout = dict(
@@ -110,11 +110,49 @@ class ChartEngine:
             return go.Figure(go.Pie(labels=plot_df[name_col], values=plot_df[value_col], hole=0.4, marker_colors=colors, textinfo="label+percent", hovertemplate="%{label}<br>%{value}<br>%{percent}<extra></extra>"))
 
         if ctype == "scatter":
-            x_col = num_cols[0]
-            y_col = num_cols[1] if len(num_cols) > 1 else num_cols[0]
-            color = cat_cols[0] if cat_cols else None
-            fig   = px.scatter(df.head(500), x=x_col, y=y_col, color=color, color_discrete_sequence=colors, opacity=0.7)
-            fig.update_traces(marker=dict(size=7))
+            # ── 1. CLUSTERING TOPOLOGY MAP (PCA/UMAP detected) ──
+            if "PCA_X" in df.columns and "PCA_Y" in df.columns:
+                x_col = "PCA_X"
+                y_col = "PCA_Y"
+                
+                # Color by cluster/persona if available
+                color = "Cluster" if "Cluster" in df.columns else (cat_cols[0] if cat_cols else None)
+                
+                # Extract actual business data for the hover tooltip (ignoring math coordinates)
+                exclude_cols = {"PCA_X", "PCA_Y", "Cluster"}
+                hover_cols = [c for c in df.columns if c not in exclude_cols][:6]
+                
+                fig = px.scatter(
+                    df.head(500), 
+                    x=x_col, 
+                    y=y_col, 
+                    color=color, 
+                    hover_data=hover_cols,
+                    color_discrete_sequence=colors, 
+                    opacity=0.8
+                )
+                
+                fig.update_traces(marker=dict(size=8, line=dict(width=0.5, color='white')))
+                
+                # Keep axes minimal but labeled with simple names
+                fig.update_xaxes(showgrid=False, zeroline=False, visible=True, title_text="PCA X")
+                fig.update_yaxes(showgrid=False, zeroline=False, visible=True, title_text="PCA Y")
+                
+            # ── 2. STANDARD SCATTER PLOT ──
+            else:
+                x_col = num_cols[0]
+                y_col = num_cols[1] if len(num_cols) > 1 else num_cols[0]
+                color = cat_cols[0] if cat_cols else None
+                fig = px.scatter(
+                    df.head(500), 
+                    x=x_col, 
+                    y=y_col, 
+                    color=color, 
+                    color_discrete_sequence=colors, 
+                    opacity=0.7
+                )
+                fig.update_traces(marker=dict(size=7))
+                
             return fig
 
         if ctype == "histogram":
@@ -141,7 +179,6 @@ class ChartEngine:
                 group_col = intent.get("group_col")
                 y_col     = "predicted" if "predicted" in df.columns else val_col
 
-                # Internal helper to draw a single country's forecast perfectly
                 def _plot_forecast(sub_df, color_idx, name_suffix=""):
                     hist = sub_df[~sub_df["is_forecast"]].copy()
                     fore = sub_df[sub_df["is_forecast"]].copy()
@@ -158,10 +195,8 @@ class ChartEngine:
                     hist_name = f"{name_suffix} (History)" if name_suffix else "Historical Truth"
                     fore_name = f"{name_suffix} (Forecast)" if name_suffix else "Predicted Trend"
                     
-                    # 1. Plot Historical (Solid Line)
                     fig.add_trace(go.Scatter(x=hist[x_hist], y=hist["actual"], name=hist_name, mode="lines+markers", line=dict(color=c, width=2.5), marker=dict(size=6)))
                     
-                    # 2. Plot Confidence Interval (ONLY if we are NOT grouping, to avoid visual clutter)
                     if not group_col and "upper_bound" in fore.columns and "lower_bound" in fore.columns:
                         fig.add_trace(go.Scatter(
                             x=pd.concat([fore[x_fore], fore[x_fore][::-1]]), 
@@ -171,12 +206,9 @@ class ChartEngine:
                             name="80% Confidence Band", showlegend=True, hoverinfo="skip"
                         ))
 
-                    # 3. Plot Forecast (Dotted Line)
-                    # If multiple groups, use their unique color. If single, use Orange.
                     fore_color = c if group_col else "#F59E0B"
                     fig.add_trace(go.Scatter(x=fore[x_fore], y=fore[y_col], name=fore_name, mode="lines+markers", line=dict(color=fore_color, width=2.5, dash="dot"), marker=dict(size=6, symbol="diamond")))
 
-                # 🔥 THE FIX: If there are multiple groups, loop through them and draw them all!
                 if group_col and group_col in df.columns:
                     for i, grp in enumerate(df[group_col].unique()):
                         _plot_forecast(df[df[group_col] == grp], i, name_suffix=str(grp))
@@ -222,6 +254,32 @@ class ChartEngine:
                         fig.add_trace(go.Scatter(x=x_anom, y=anom[val_col], name="Anomaly", mode="markers", marker=dict(color="#F43F5E", size=10, symbol="x")))
 
                 fig.update_layout(title="Anomaly Detection")
+
+            elif ptype == "classification":
+                # Confusion matrix heatmap — rows = actual class, columns = predicted class.
+                # A perfect classifier would show all its "mass" along the diagonal.
+                classes = intent.get("classes", [])
+                cm      = intent.get("confusion_matrix")
+                if not cm or not classes:
+                    return None
+
+                fig = go.Figure(go.Heatmap(
+                    z=cm,
+                    x=classes,
+                    y=classes,
+                    colorscale=[[0, "#F8FAFC"], [0.5, "#A5B4FC"], [1, "#4338CA"]],
+                    text=cm,
+                    texttemplate="%{text}",
+                    textfont=dict(size=13, color="#0F172A"),
+                    hovertemplate="Actual: %{y}<br>Predicted: %{x}<br>Count: %{z}<extra></extra>",
+                    showscale=True,
+                ))
+                fig.update_layout(
+                    title="Confusion Matrix (rows = actual, columns = predicted)",
+                    xaxis_title="Predicted class",
+                    yaxis_title="Actual class",
+                    yaxis=dict(autorange="reversed"),
+                )
             else: return None
 
             fig.update_layout(**self._base_layout())
@@ -242,7 +300,6 @@ def build_auto_chart(df, question, chart_type=None):
 def build_forecast_chart(result, date_col, value_col):
     data   = result["data"]
     
-    # 🔥 THE FIX: If the data is a dictionary (multiple groups), stitch them together safely!
     if isinstance(data, dict):
         parts = []
         for grp, df_grp in data.items():
@@ -274,3 +331,13 @@ def build_anomaly_chart(result, date_col, value_col):
         
     intent = {"type": "anomaly", "date_col": date_col, "value_col": value_col}
     return _engine.prediction_chart(df, intent, None) if df is not None else None
+
+def build_classification_chart(result):
+    """Confusion-matrix chart for a trained SupervisedClassifierEngine result."""
+    meta = result.get("meta", {})
+    intent = {
+        "type":             "classification",
+        "classes":          meta.get("classes", []),
+        "confusion_matrix": meta.get("confusion_matrix"),
+    }
+    return _engine.prediction_chart(result["data"], intent, None)

@@ -1,13 +1,9 @@
-"""
-main.py  —  FastAPI backend for the Analytics AI platform
-"""
-
 import os
 import math
 import uuid
 import tempfile
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict
 
 import pandas as pd
 from fastapi import FastAPI, UploadFile, File, HTTPException
@@ -17,7 +13,11 @@ from pydantic import BaseModel
 from analytics_engine  import AnalyticsEngine
 from intent_classifier import IntentClassifier
 from sql_generator     import SQLGenerator
-from prediction_engine import ForecastEngine, TrendEngine, RegressionEngine, AnomalyEngine, ClusterEngine
+from sql_safety        import validate_select_only, UnsafeSQLError
+from prediction_engine import (
+    ForecastEngine, TrendEngine, RegressionEngine, AnomalyEngine,
+    ClusterEngine, SupervisedClassifierEngine,
+)
 from chart_engine      import (
     build_auto_chart,
     build_forecast_chart,
@@ -25,6 +25,7 @@ from chart_engine      import (
     build_regression_chart,
     build_fi_chart,
     build_anomaly_chart,
+    build_classification_chart,
 )
 from insight_engine import InsightEngine
 
@@ -48,8 +49,11 @@ app.add_middleware(
 
 
 # ── Shared singletons ──────────────────────────────────────────────────────────
-# NOTE: ClusterEngine.__init__ no longer touches Groq — safe to instantiate
-#       even when GROQ_API_KEY is absent from the environment.
+# NOTE: These remain module-level because they hold NO per-request mutable state —
+# each call to .run()/.classify()/.generate_sql() is self-contained. ClusterEngine
+# is different: it stores a trained model (self.clf, self.scaler, self.cat_mappings)
+# as instance state across calls, so it CANNOT be a shared global — see get_session()
+# below, where each session gets its own ClusterEngine instance instead.
 
 classifier     = IntentClassifier()
 sql_gen        = SQLGenerator()
@@ -58,7 +62,6 @@ forecast_eng   = ForecastEngine()
 trend_eng      = TrendEngine()
 regression_eng = RegressionEngine()
 anomaly_eng    = AnomalyEngine()
-cluster_eng    = ClusterEngine()
 
 
 # ── In-memory session store ────────────────────────────────────────────────────
@@ -68,8 +71,14 @@ SESSIONS: dict[str, dict] = {}
 def get_session(session_id: str) -> dict:
     if session_id not in SESSIONS:
         SESSIONS[session_id] = {
-            "engine":  AnalyticsEngine(),
-            "history": [],
+            "engine":         AnalyticsEngine(),
+            "cluster_engine": ClusterEngine(),   # per-session — holds trained model state
+            # Supervised classifiers, keyed by the real label column each was
+            # trained against (a session can train more than one classifier
+            # on different label columns). Same isolation requirement as
+            # ClusterEngine — holds trained model state, so must be per-session.
+            "classifiers":    {},   # {label_col: SupervisedClassifierEngine}
+            "history":        [],
         }
     return SESSIONS[session_id]
 
@@ -80,41 +89,38 @@ class QueryRequest(BaseModel):
     question:   str
     chart_type: Optional[str] = "auto"
 
+class PredictPointRequest(BaseModel):
+    point: Dict[str, float | int | str]
+
+class PredictLabelRequest(BaseModel):
+    label_col: str
+    point: Dict[str, float | int | str]
+
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 def _deep_sanitize(obj):
-    """
-    Recursively sweeps dictionaries, lists, and values to safely unwrap 
-    any rogue NumPy types or NaNs before FastAPI converts them to JSON.
-    """
-    # 1. Safely unwrap NumPy wrappers (np.bool_, np.int64, np.float64)
     if hasattr(obj, "item"):
         try:
             return obj.item()
         except Exception:
             pass
-            
-    # 2. Recursively sweep dictionaries
+
     if isinstance(obj, dict):
         return {k: _deep_sanitize(v) for k, v in obj.items()}
-        
-    # 3. Recursively sweep lists/tuples
+
     if isinstance(obj, list) or isinstance(obj, tuple):
         return [_deep_sanitize(v) for v in obj]
-        
-    # 4. Handle invalid JSON floats (NaN, Infinity)
+
     if isinstance(obj, float) and (math.isnan(obj) or math.isinf(obj)):
         return None
-        
-    # 5. Stringify Pandas timestamps
+
     if isinstance(obj, pd.Timestamp):
         return str(obj)
-        
+
     return obj
 
 def df_to_rows(df: pd.DataFrame, max_rows: int = 500) -> dict:
-    """Serialise a DataFrame to JSON-safe rows/columns."""
     if df is None or df.empty:
         return {"columns": [], "rows": [], "total_rows": 0}
 
@@ -125,8 +131,6 @@ def df_to_rows(df: pd.DataFrame, max_rows: int = 500) -> dict:
         display[col] = display[col].astype(str)
 
     display = display.replace([float("inf"), float("-inf")], None)
-    
-    # Apply deep sanitization to every cell
     rows    = [[_deep_sanitize(cell) for cell in row] for row in display.values.tolist()]
 
     return {
@@ -135,10 +139,7 @@ def df_to_rows(df: pd.DataFrame, max_rows: int = 500) -> dict:
         "total_rows": total,
     }
 
-
-
 def extract_metrics(df: pd.DataFrame) -> dict:
-    """Pull simple headline metrics from a small result DF."""
     if df is None or df.empty or len(df) > 20:
         return {}
     metrics = {}
@@ -159,12 +160,10 @@ def extract_metrics(df: pd.DataFrame) -> dict:
 # ── Master Dispatcher ──────────────────────────────────────────────────────────
 
 class AnalyticsDispatcher:
-    """
-    Routes intent → engine → response. All engine calls are isolated
-    inside try/except so one broken path can't crash the others.
-    """
-    def __init__(self, engine: AnalyticsEngine):
+    def __init__(self, engine: AnalyticsEngine, cluster_engine: ClusterEngine, classifiers: dict):
         self.engine = engine
+        self.cluster_engine = cluster_engine
+        self.classifiers = classifiers   # {label_col: SupervisedClassifierEngine}, session-scoped, mutated in place
 
     def _get_clean_dataframe(self, intent: dict, target_tables: list) -> pd.DataFrame:
         cols = [
@@ -173,7 +172,7 @@ class AnalyticsDispatcher:
             intent.get("group_col"),
             intent.get("target_col"),
         ]
-        cols      = [c for c in cols if c] + (intent.get("feature_cols") or [])
+        cols       = [c for c in cols if c] + (intent.get("feature_cols") or [])
         valid_cols = self.engine.tables.get(target_tables[0], {}).get("columns", [])
         safe_cols  = [c for c in set(cols) if c in valid_cols] if cols else []
 
@@ -190,10 +189,52 @@ class AnalyticsDispatcher:
 
     def handle_query(self, question: str, chart_type_override: str) -> dict:
         enriched_schema = getattr(self.engine, "get_enriched_schema", self.engine.get_all_schemas)()
-        intent          = classifier.classify(question, enriched_schema)
-        intent_type     = intent.get("type", "sql")
-        chart_type      = chart_type_override if chart_type_override != "auto" else intent.get("chart_type", "bar")
-        target_tables   = intent.get("tables", [])
+
+        q_lower = question.lower()
+
+        # ── Disambiguating unsupervised vs. supervised point queries ──────────
+        # Both ClusterEngine.predict_point and SupervisedClassifierEngine.predict_point
+        # answer "what would this record be classified as", so generic keywords like
+        # "belong"/"match"/"classify" alone can't tell them apart once a session has
+        # trained BOTH kinds of model. Instead: for supervised models, we check whether
+        # the question references the ACTUAL trained label column's name (e.g. a
+        # classifier trained on "risk_tier" gets matched by "which risk tier..."). This
+        # scales cleanly to multiple trained classifiers on different label columns,
+        # since each is disambiguated by its own label name rather than shared keywords.
+        import re as _re
+        # "classif" (not "classify") catches classify/classified/classification;
+        # "would" (not the fragile "what would" bigram) catches "what X would...".
+        action_words = ["belong", "match", "classif", "predict", "would", "which"]
+        has_action_word   = any(w in q_lower for w in action_words)
+        has_numeric_value = bool(_re.search(r'\d', question))
+
+        matched_label_col = None
+        # Require a concrete numeric value in the question, not just the label
+        # name + an action word — otherwise a plain aggregation question like
+        # "which region has the highest utilization" or a training request like
+        # "predict billable hours from FTE and region" (region mentioned only
+        # as a FEATURE, not as the thing being predicted for one record) would
+        # incorrectly route to point-classification instead of SQL/training.
+        if has_action_word and has_numeric_value:
+            for label_col in self.classifiers.keys():
+                label_words = label_col.replace("_", " ").lower()
+                if label_words and label_words in q_lower:
+                    matched_label_col = label_col
+                    break
+
+        is_prediction_intent = ("cluster" in q_lower or "persona" in q_lower) and any(w in q_lower for w in ["belong", "match", "predict", "classify", "if a"])
+
+        if matched_label_col:
+            intent_type = "predict_label"
+            target_tables = [self.engine.active_table]
+        elif is_prediction_intent and self.cluster_engine.clf is not None:
+            intent_type = "predict_point"
+            target_tables = [self.engine.active_table]
+        else:
+            intent          = classifier.classify(question, enriched_schema)
+            intent_type     = intent.get("type", "sql")
+            chart_type      = chart_type_override if chart_type_override != "auto" else intent.get("chart_type", "bar")
+            target_tables   = intent.get("tables", [])
 
         if not target_tables or not isinstance(target_tables, list):
             target_tables = [self.engine.active_table]
@@ -213,14 +254,112 @@ class AnalyticsDispatcher:
         }
 
         try:
-            # ── SQL & SUMMARY ──────────────────────────────────────────────────
-            if intent_type in ("sql", "summary"):
-                sql    = sql_gen.generate_sql(question, enriched_schema, target_tables)
+            # ── SUPERVISED POINT CLASSIFICATION (IN-CHAT) ─────────────────────
+            if intent_type == "predict_label":
+                clf_engine = self.classifiers[matched_label_col]
+                result = clf_engine.predict_point_from_text(question)
+
+                if "error" in result:
+                    response["error"] = result["error"]
+                else:
+                    label = result["predicted_label"]
+                    conf  = result["match_confidence"] * 100
+
+                    response["metrics"] = {
+                        f"Predicted {matched_label_col.replace('_', ' ').title()}": str(label),
+                        "Match Confidence": f"{conf:.1f}%",
+                    }
+
+                    matrix = " | ".join([f"{k} ({v*100:.1f}%)" for k, v in result["confidence_matrix"].items()])
+                    narrative = (
+                        f"Based on the trained classifier for **{matched_label_col}**, this record is "
+                        f"predicted as **{label}** with {conf:.1f}% confidence. Probability Matrix: [ {matrix} ]"
+                    )
+                    if result.get("defaulted_fields"):
+                        narrative += f" ⚠️ {result['warning']}"
+                    response["stat_narrative"] = narrative
+
+                    extracted = result["extracted_features"]
+                    response["columns"] = list(extracted.keys())
+                    response["rows"] = [[str(v) for v in extracted.values()]]
+                    response["total_rows"] = 1
+
+                    response["insights"] = [
+                        f"The Natural Language engine successfully extracted {len(extracted)} parameters from your query.",
+                        f"The trained classifier matched these parameters against learned patterns for '{matched_label_col}'."
+                    ]
+                    if result.get("defaulted_fields"):
+                        response["insights"].append(
+                            f"⚠️ Defaulted (not specified in your question): {', '.join(result['defaulted_fields'])}. "
+                            f"Prediction confidence should be treated as lower than usual."
+                        )
+
+                    response["type"] = "summary"
+
+            # ── POINT PREDICTION (IN-CHAT) ────────────────────────────────────
+            elif intent_type == "predict_point":
+                result = self.cluster_engine.predict_point_from_text(question)
+
+                if "error" in result:
+                    response["error"] = result["error"]
+                else:
+                    persona = result["assigned_persona"]
+                    conf = result["match_confidence"] * 100
+
+                    # 1. Feed the KPI Cards (Safe for React rendering)
+                    response["metrics"] = {
+                        "Assigned Persona": str(persona).title(),
+                        "Match Confidence": f"{conf:.1f}%"
+                    }
+
+                    # 2. Feed the Summary Narrative (Renders in the italic ~ strip)
+                    matrix = " | ".join([f"{k} ({v*100:.1f}%)" for k, v in result["confidence_matrix"].items()])
+                    narrative = (
+                        f"Based on the trained Random Forest model, this customer profile belongs to the **{persona}** persona "
+                        f"with {conf:.1f}% confidence. Probability Matrix: [ {matrix} ]"
+                    )
+                    if result.get("defaulted_fields"):
+                        narrative += f" ⚠️ {result['warning']}"
+                    response["stat_narrative"] = narrative
+
+                    # 3. Feed the Data Table (Proves to the user what the LLM extracted)
+                    extracted = result["extracted_features"]
+                    response["columns"] = list(extracted.keys())
+                    response["rows"] = [[str(v) for v in extracted.values()]]
+                    response["total_rows"] = 1
+
+                    # 4. Safely mock the insights array to prevent .map() crashes in the frontend
+                    response["insights"] = [
+                        f"The Natural Language engine successfully extracted {len(extracted)} parameters from your query.",
+                        f"The classifier matched these parameters to the geometric boundaries of the '{persona}' cluster."
+                    ]
+                    if result.get("defaulted_fields"):
+                        response["insights"].append(
+                            f"⚠️ Defaulted (not specified in your question): {', '.join(result['defaulted_fields'])}. "
+                            f"Prediction confidence should be treated as lower than usual."
+                        )
+
+                    response["type"] = "summary"
+
+            elif intent_type in ("sql", "summary"):
+                sql = sql_gen.generate_sql(question, enriched_schema, target_tables)
+
+                try:
+                    validate_select_only(sql, set(self.engine.tables.keys()))
+                except UnsafeSQLError as e:
+                    response["error"] = f"Generated query was rejected for safety: {e}"
+                    return response
+
                 response["sql"] = sql
                 result = self.engine.execute_sql(sql)
 
                 if result["error"]:
                     fixed_sql = sql_gen.fix_sql(sql, result["error"], enriched_schema)
+                    try:
+                        validate_select_only(fixed_sql, set(self.engine.tables.keys()))
+                    except UnsafeSQLError as e:
+                        response["error"] = f"Corrected query was rejected for safety: {e}"
+                        return response
                     response["sql"] = fixed_sql
                     result = self.engine.execute_sql(fixed_sql)
 
@@ -236,7 +375,6 @@ class AnalyticsDispatcher:
                     question, intent_type, df.head(200), response["metrics"]
                 )
 
-            # ── FORECAST ──────────────────────────────────────────────────────
             elif intent_type == "forecast":
                 date_col, value_col = intent.get("date_col"), intent.get("value_col")
                 if not date_col or not value_col:
@@ -265,7 +403,6 @@ class AnalyticsDispatcher:
 
                 response["chart"]   = build_forecast_chart(result, date_col, value_col)
 
-                # Surface empirical coverage so the frontend can show it
                 cov     = stat_meta.get("empirical_coverage")
                 z_mult  = stat_meta.get("z_multiplier", 1.645)
                 ci_pct  = "95%" if z_mult >= 2.0 else "90%"
@@ -288,7 +425,6 @@ class AnalyticsDispatcher:
                     stat_meta=stat_meta,
                 )
 
-            # ── TREND ─────────────────────────────────────────────────────────
             elif intent_type == "trend":
                 date_col, value_col = intent.get("date_col"), intent.get("value_col")
                 if not date_col or not value_col:
@@ -319,7 +455,6 @@ class AnalyticsDispatcher:
                     extra_context=stat_meta.get("narrative", ""), stat_meta=stat_meta,
                 )
 
-            # ── ANOMALY ───────────────────────────────────────────────────────
             elif intent_type == "anomaly":
                 df_clean  = self._get_clean_dataframe(intent, target_tables)
                 value_col = intent.get("value_col")
@@ -335,7 +470,7 @@ class AnalyticsDispatcher:
                 result   = anomaly_eng.run(
                     df_clean, value_col, date_col,
                     intent.get("group_col"),
-                    contamination="auto",   # always auto-estimate
+                    contamination="auto",
                 )
 
                 if "error" in result:
@@ -362,11 +497,16 @@ class AnalyticsDispatcher:
                     stat_meta=stat_meta,
                 )
 
-            # ── REGRESSION ────────────────────────────────────────────────────
             elif intent_type == "regression":
                 target_col, feature_cols = intent.get("target_col"), intent.get("feature_cols")
                 if not target_col or not feature_cols:
                     return {**response, "error": "Could not identify target and feature columns for regression."}
+
+                # Defensive guard, in addition to the classifier-side consolidation:
+                # never let the prediction target sit inside its own feature list.
+                feature_cols = [c for c in feature_cols if c != target_col]
+                if not feature_cols:
+                    return {**response, "error": "No usable feature columns remain after excluding the target column."}
 
                 df_clean = self._get_clean_dataframe(intent, target_tables)
                 result   = regression_eng.run(df_clean, target_col, feature_cols)
@@ -392,7 +532,6 @@ class AnalyticsDispatcher:
                     question, "regression", result["data"], result["metrics"]
                 )
 
-            # ── CLUSTERING ────────────────────────────────────────────────────
             elif intent_type == "clustering":
                 df_clean     = self._get_clean_dataframe(intent, target_tables)
                 feature_cols = intent.get("feature_cols")
@@ -400,7 +539,8 @@ class AnalyticsDispatcher:
                 if not feature_cols:
                     feature_cols = df_clean.columns.tolist()
 
-                result = cluster_eng.run(df_clean, feature_cols)
+                domain_context = intent.get("domain_context")
+                result = self.cluster_engine.run(df_clean, feature_cols, domain_context=domain_context)
 
                 if "error" in result:
                     return {**response, "error": result["error"]}
@@ -413,6 +553,7 @@ class AnalyticsDispatcher:
                 response["metrics"] = {
                     "Optimal Clusters":  str(meta["k"]),
                     "Silhouette Score":  f"{meta['silhouette']:.2f}",
+                    "Algorithm":         meta["algorithm"],
                     "#1 Split Factor":   meta["top_driver"].replace("_", " ").title(),
                     "Outliers Isolated": str(meta.get("outlier_count", 0)),
                     "PCA Var (PC1+PC2)": (
@@ -421,6 +562,9 @@ class AnalyticsDispatcher:
                     ),
                 }
                 response["stat_narrative"] = meta["narrative"]
+                response["clustering_leaderboard"] = meta.get("clustering_leaderboard", [])
+                response["classifier_leaderboard"]  = meta.get("classifier_leaderboard", [])
+                response["classifier_model"]        = meta.get("classifier_model")
 
                 if fi_df is not None:
                     response["feature_importance"] = {
@@ -431,6 +575,70 @@ class AnalyticsDispatcher:
                 response["chart"]    = build_auto_chart(df_cluster, "scatter", question)
                 response["insights"] = insight_eng.generate(
                     question, "clustering", df_cluster.head(100),
+                    response["metrics"],
+                    extra_context=meta["narrative"],
+                )
+
+            # ── SUPERVISED CLASSIFICATION (TRAINING) ──────────────────────────
+            # Trains against a REAL label column already in the data — distinct
+            # from "clustering" above, which discovers groups with no ground truth.
+            elif intent_type == "classification":
+                target_col, feature_cols = intent.get("target_col"), intent.get("feature_cols")
+                if not target_col or not feature_cols:
+                    return {
+                        **response,
+                        "error": (
+                            "Could not identify a label column and feature columns for classification. "
+                            "Specify which existing column holds the category you want to predict."
+                        ),
+                    }
+
+                # Defensive guard, same pattern as regression: never let the
+                # label sit inside its own feature list.
+                feature_cols = [c for c in feature_cols if c != target_col]
+                if not feature_cols:
+                    return {**response, "error": "No usable feature columns remain after excluding the label column."}
+
+                df_clean = self._get_clean_dataframe(intent, target_tables)
+
+                # Reuse an existing trained classifier for this label column if one
+                # exists in the session, otherwise train a fresh one. Re-running the
+                # same classification question re-trains (intentional — lets the user
+                # retrain after uploading corrected data without restarting the session).
+                clf_engine = SupervisedClassifierEngine()
+                result = clf_engine.run(df_clean, feature_cols, target_col)
+
+                if "error" in result:
+                    return {**response, "error": result["error"]}
+
+                self.classifiers[target_col] = clf_engine   # persist trained model in session
+
+                df_result = result["data"]
+                meta      = result["meta"]
+                fi_df     = result.get("feature_importance")
+
+                response.update(df_to_rows(df_result))
+                response["metrics"] = {
+                    "Accuracy":        f"{meta['accuracy']*100:.1f}%",
+                    "F1 (weighted)":   f"{meta['f1_weighted']:.3f}",
+                    "Model":           meta.get("classifier_model", "—"),
+                    "Classes":         str(meta["n_classes"]),
+                    "Label Column":    meta["label_col"],
+                }
+                response["stat_narrative"]     = meta["narrative"]
+                response["confusion_matrix"]   = {"classes": meta["classes"], "matrix": meta["confusion_matrix"]}
+                response["label_distribution"] = meta["label_distribution"]
+                response["classifier_leaderboard"] = meta.get("classifier_leaderboard", [])
+
+                if fi_df is not None:
+                    response["feature_importance"] = {
+                        "columns": fi_df.columns.tolist(),
+                        "rows":    fi_df.values.tolist(),
+                    }
+
+                response["chart"]    = build_classification_chart(result)
+                response["insights"] = insight_eng.generate(
+                    question, "classification", df_result.head(100),
                     response["metrics"],
                     extra_context=meta["narrative"],
                 )
@@ -479,12 +687,14 @@ async def upload_file(session_id: str, file: UploadFile = File(...)):
 @app.post("/query/{session_id}")
 async def query(session_id: str, req: QueryRequest):
     session = get_session(session_id)
-    engine: AnalyticsEngine = session["engine"]
+    engine: AnalyticsEngine       = session["engine"]
+    cluster_engine: ClusterEngine = session["cluster_engine"]
+    classifiers: dict             = session["classifiers"]
 
     if not engine.tables:
         raise HTTPException(400, "No file uploaded yet. Please upload a CSV or Excel file first.")
 
-    dispatcher = AnalyticsDispatcher(engine)
+    dispatcher = AnalyticsDispatcher(engine, cluster_engine, classifiers)
     response   = dispatcher.handle_query(req.question.strip(), req.chart_type)
 
     session["history"].append({
@@ -495,6 +705,39 @@ async def query(session_id: str, req: QueryRequest):
         session["history"] = session["history"][-20:]
 
     return response
+
+
+@app.post("/predict_cluster/{session_id}")
+async def predict_cluster(session_id: str, req: PredictPointRequest):
+    session = get_session(session_id)
+    cluster_engine: ClusterEngine = session["cluster_engine"]
+
+    try:
+        result = cluster_engine.predict_point(req.point)
+        return _deep_sanitize(result)
+    except Exception as e:
+        return {"error": f"Prediction failed: {str(e)}"}
+
+
+@app.post("/predict_label/{session_id}")
+async def predict_label(session_id: str, req: PredictLabelRequest):
+    session = get_session(session_id)
+    classifiers: dict = session["classifiers"]
+
+    clf_engine = classifiers.get(req.label_col)
+    if clf_engine is None:
+        return {
+            "error": (
+                f"No trained classifier found for label column '{req.label_col}'. "
+                "Train one first by asking a classification question against labeled data."
+            )
+        }
+
+    try:
+        result = clf_engine.predict_point(req.point)
+        return _deep_sanitize(result)
+    except Exception as e:
+        return {"error": f"Prediction failed: {str(e)}"}
 
 
 @app.get("/history/{session_id}")

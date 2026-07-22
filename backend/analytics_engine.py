@@ -69,34 +69,53 @@ class AnalyticsEngine:
             "columns": df.columns.tolist(),
             "dtypes": {col: self._classify_dtype(df[col]) for col in df.columns},
             "raw_dtypes": {col: str(df[col].dtype) for col in df.columns},
+            # Computed per-table now, so every sheet in a multi-sheet upload
+            # gets its own real health score instead of only the active table.
+            "health": self.calculate_data_health(df),
         }
 
-    # ── NEW: Data Health Scanner ───────────────────────────────────────
+    # ── Data Health Scanner ──────────────────────────────────────────────
 
     def calculate_data_health(self, df: pd.DataFrame) -> dict:
-        """Scans the dataframe for missing values and duplicates to generate a health score."""
+        """Scans the dataframe for missing values and duplicates to generate a health score.
+
+        Score weights nulls more heavily than duplicates (0.7 / 0.3 split) since
+        missing values directly break downstream forecast/regression/cluster
+        engines, while duplicate rows are a data-quality smell that's usually
+        less immediately harmful but still worth surfacing and penalizing.
+        """
         total_rows = len(df)
         if total_rows == 0:
             return {"score": 0, "warnings": ["Dataset is entirely empty."]}
 
-        total_cells = total_rows * len(df.columns)
-        missing_cells = df.isnull().sum().sum()
-        duplicate_rows = df.duplicated().sum()
+        total_cells    = total_rows * len(df.columns)
+        missing_cells  = int(df.isnull().sum().sum())
+        duplicate_rows = int(df.duplicated().sum())
 
-        # Score out of 100 based on clean cells
-        health_score = max(0, round(100 * (1 - (missing_cells / total_cells)), 1))
+        null_pct = missing_cells / total_cells if total_cells else 0
+        dup_pct  = duplicate_rows / total_rows if total_rows else 0
+
+        health_score = max(
+            0,
+            round(100 * (1 - null_pct * 0.7 - dup_pct * 0.3), 1)
+        )
 
         warnings = []
         if missing_cells > 0:
-            warnings.append(f"Found {int(missing_cells)} missing values. (Our AI engines will automatically interpolate these during analysis).")
+            warnings.append(
+                f"Found {missing_cells} missing values. "
+                "(Our AI engines will automatically interpolate these during analysis)."
+            )
         if duplicate_rows > 0:
-            warnings.append(f"Found {int(duplicate_rows)} duplicate rows. Consider cleaning your source file.")
+            warnings.append(
+                f"Found {duplicate_rows} duplicate rows. Consider cleaning your source file."
+            )
 
         return {
             "score": health_score,
             "warnings": warnings,
-            "missing_cells": int(missing_cells),
-            "duplicate_rows": int(duplicate_rows)
+            "missing_cells": missing_cells,
+            "duplicate_rows": duplicate_rows,
         }
 
     # ── public API ─────────────────────────────────────────────────────
@@ -117,17 +136,15 @@ class AnalyticsEngine:
                     self._register(table_name, df)
 
         self.active_table = list(self.tables.keys())[0]
-        active_df = self.get_dataframe(self.active_table)
-        
-        # Calculate real data health
-        health_metrics = self.calculate_data_health(active_df)
 
         return {
             "tables": list(self.tables.keys()),
             "active_table": self.active_table,
             "columns": self.tables[self.active_table]["columns"],
+            # Each entry in table_details now carries its own "health" dict
+            # (score + warnings + missing_cells + duplicate_rows), computed
+            # per-sheet in _register() rather than once for the active table only.
             "table_details": self.tables,
-            "data_health": health_metrics, # Pass the real metrics to the frontend
         }
 
     def get_dataframe(self, table_name: str = None) -> pd.DataFrame:
@@ -142,12 +159,12 @@ class AnalyticsEngine:
                 dtype = info["dtypes"].get(col, "")
                 text += f"  - {col} ({dtype})\n"
         return text
-        
+
     def get_enriched_schema(self) -> str:
         """Generates schema info with explicitly detected join relationships."""
         if not self.tables:
             return "No tables loaded."
-            
+
         schema_text = "Tables:\n"
         column_map = {}
 
@@ -156,7 +173,7 @@ class AnalyticsEngine:
             for col in info["columns"]:
                 dtype = info["dtypes"].get(col, "")
                 schema_text += f"  - {col} ({dtype})\n"
-                
+
                 # Map column to tables for relationship detection
                 if col not in column_map:
                     column_map[col] = []
@@ -166,15 +183,15 @@ class AnalyticsEngine:
         # We ignore generic common names that usually aren't keys
         ignore_cols = {'id', 'date', 'created_at', 'updated_at', 'index', 'name', 'status', 'type'}
         possible_joins = {
-            col: tbls for col, tbls in column_map.items() 
+            col: tbls for col, tbls in column_map.items()
             if len(tbls) > 1 and col.lower() not in ignore_cols
         }
-        
+
         if possible_joins:
             schema_text += "\nPossible Join Relationships (Foreign Keys):\n"
             for col, tbls in possible_joins.items():
                 schema_text += f"- Column '{col}' can link tables: {', '.join(tbls)}\n"
-                
+
         return schema_text
 
     def execute_sql(self, sql: str) -> dict:
