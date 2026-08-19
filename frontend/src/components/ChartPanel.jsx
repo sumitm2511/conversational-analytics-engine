@@ -69,6 +69,18 @@ const ChartPanel = forwardRef(function ChartPanel({ chart, onRequestChart, loadi
     toImageButtonOptions: { format: "png", filename: "chart", width: 1200, height: 600 }
   }
 
+  // Point 8: sample-size transparency. build_auto_chart() attaches
+  // sample_info = { shown, total } whenever the underlying data was too
+  // large to plot every point and a representative sample was used instead
+  // (see chart_engine.py's _stratified_sample). Surface it plainly rather
+  // than silently rendering a subset with no indication — this is exactly
+  // the kind of thing that erodes trust if a viewer assumes they're seeing
+  // every point when they're not.
+  const sampleInfo = chart.sample_info
+  const sampleCaption = sampleInfo && sampleInfo.total > sampleInfo.shown
+    ? `Showing a representative sample of ${sampleInfo.shown.toLocaleString()} of ${sampleInfo.total.toLocaleString()} points`
+    : null
+
   return (
     <>
       <div className="chart-panel-wrap">
@@ -82,6 +94,16 @@ const ChartPanel = forwardRef(function ChartPanel({ chart, onRequestChart, loadi
           </div>
           <button className="fullscreen-btn" onClick={() => setFullscreen(true)} title="Fullscreen">⛶</button>
         </div>
+
+        {sampleCaption && (
+          <div className="chart-sample-caption" style={{
+            fontSize: "12px", color: "#94A3B8", padding: "8px 18px 0",
+            display: "flex", alignItems: "center", gap: "6px"
+          }}>
+            <span>ℹ</span> {sampleCaption}
+          </div>
+        )}
+
         {/* 🔥 TALLER CHART SO YOU DON'T HAVE TO ZOOM */}
         <Plot ref={plotRef} data={chart.data} layout={plotLayout} config={plotConfig} useResizeHandler style={{ width: "100%", height: "450px", minHeight: "450px" }} />
       </div>
@@ -91,6 +113,9 @@ const ChartPanel = forwardRef(function ChartPanel({ chart, onRequestChart, loadi
           <div className="fullscreen-modal" onClick={e => e.stopPropagation()}>
             <div className="fullscreen-header">
               <span className="fullscreen-title">Chart View</span>
+              {sampleCaption && (
+                <span style={{ fontSize: "12px", color: "#94A3B8", marginLeft: "12px" }}>{sampleCaption}</span>
+              )}
               <button className="fullscreen-close" onClick={() => setFullscreen(false)}>✕</button>
             </div>
             <Plot data={chart.data} layout={{ ...plotLayout, height: undefined, autosize: true }} config={plotConfig} useResizeHandler style={{ width: "100%", height: "calc(90vh - 80px)" }} />

@@ -1,5 +1,7 @@
 import React, { useState, useRef } from "react"
+import axios from "axios"
 import { v4 as uuidv4 } from "uuid"
+import { API_BASE } from "./config"
 import TopBar       from "./components/TopBar"
 import FileUpload   from "./components/FileUpload"
 import ChatPanel    from "./components/ChatPanel"
@@ -18,6 +20,7 @@ export default function App() {
   const [loading,       setLoading]       = useState(false)
   const [sidebarOpen,   setSidebarOpen]   = useState(true)   // ← collapsible
   const [sidebarPinned, setSidebarPinned] = useState(true)   // ← pin vs hover
+
   const chatRef  = useRef()
   const hoverRef = useRef()
 
@@ -95,6 +98,7 @@ export default function App() {
                 sessionId={SESSION_ID}
                 onLoaded={(info, name) => handleFileLoaded(info, name)}
               />
+
               {schema && <SchemaPanel schema={schema} />}
             </>
           )}

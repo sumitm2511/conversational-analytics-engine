@@ -3,7 +3,44 @@ import plotly.express as px
 import plotly.graph_objects as go
 import json
 
+
+def _stratified_sample(df: pd.DataFrame, color_col: str | None, max_rows: int = 500) -> pd.DataFrame:
+    """
+    Caps a dataframe at max_rows for chart rendering performance, but samples
+    PROPORTIONALLY from each category in color_col instead of just taking the
+    first N rows — df.head(max_rows) on a file sorted by any real-world field
+    (date, region, ID) can render a chart built entirely from one category,
+    silently missing the others. Falls back to a plain random sample if there's
+    no color column to stratify by, and to head() only as a last resort if
+    sampling itself fails for some reason (e.g. a degenerate single-value column).
+    """
+    if len(df) <= max_rows:
+        return df
+
+    if not color_col or color_col not in df.columns:
+        return df.sample(max_rows, random_state=42)
+
+    try:
+        # Proportional allocation per category, at least 1 row per category
+        # present so small clusters/categories don't vanish from the chart.
+        counts = df[color_col].value_counts()
+        frac = max_rows / len(df)
+        sampled_parts = []
+        for cat, n in counts.items():
+            take = max(1, int(round(n * frac)))
+            sampled_parts.append(df[df[color_col] == cat].sample(min(take, n), random_state=42))
+        result = pd.concat(sampled_parts)
+        # Rounding can overshoot slightly — trim back down to max_rows if needed
+        if len(result) > max_rows:
+            result = result.sample(max_rows, random_state=42)
+        return result
+    except Exception:
+        return df.head(max_rows)
+
 class ChartEngine:
+
+    def __init__(self):
+        self._last_sample_info = None   # set during scatter chart building when a sample is used
 
     def _detect_chart_type(self, df: pd.DataFrame, question: str, chart_type: str | None) -> str:
         if chart_type and chart_type != "auto":
@@ -49,12 +86,15 @@ class ChartEngine:
         date_cols = [c for c in df.columns if any(k in c.lower() for k in ["date", "month", "year", "time", "period"])]
         colors    = self._get_colors()
 
+        self._last_sample_info = None   # set by _build_chart's scatter branch if it samples down
         try:
             fig = self._build_chart(df, ctype, num_cols, cat_cols, date_cols, colors, question)
             if fig is None: return None
             fig.update_layout(**self._base_layout())
             result = json.loads(fig.to_json())
             result["suggested_type"] = ctype
+            if self._last_sample_info:
+                result["sample_info"] = self._last_sample_info
             return result
         except Exception as e:
             print(f"Chart error: {e}")
@@ -121,9 +161,24 @@ class ChartEngine:
                 # Extract actual business data for the hover tooltip (ignoring math coordinates)
                 exclude_cols = {"PCA_X", "PCA_Y", "Cluster"}
                 hover_cols = [c for c in df.columns if c not in exclude_cols][:6]
-                
+
+                # Stratified sampling by cluster, not df.head(500) — the plot
+                # cap still applies (500 points max, for render performance),
+                # but every cluster keeps proportional representation instead
+                # of the chart silently showing only whatever happened to be
+                # first in upload order. head(500) on a file sorted by any
+                # real-world field (date, region, employee ID — the normal
+                # case for exported spreadsheets) can show a chart drawn from
+                # a single category and completely miss others, which is what
+                # was producing similar-looking charts across different files —
+                # confirmed during testing: a region-sorted file's head(500)
+                # came from ONE region only, out of four present in the data.
+                plot_df = _stratified_sample(df, color, max_rows=500)
+                if len(plot_df) < len(df):
+                    self._last_sample_info = {"shown": len(plot_df), "total": len(df)}
+
                 fig = px.scatter(
-                    df.head(500), 
+                    plot_df, 
                     x=x_col, 
                     y=y_col, 
                     color=color, 
@@ -143,8 +198,11 @@ class ChartEngine:
                 x_col = num_cols[0]
                 y_col = num_cols[1] if len(num_cols) > 1 else num_cols[0]
                 color = cat_cols[0] if cat_cols else None
+                plot_df = _stratified_sample(df, color, max_rows=500)
+                if len(plot_df) < len(df):
+                    self._last_sample_info = {"shown": len(plot_df), "total": len(df)}
                 fig = px.scatter(
-                    df.head(500), 
+                    plot_df, 
                     x=x_col, 
                     y=y_col, 
                     color=color, 

@@ -139,6 +139,33 @@ def df_to_rows(df: pd.DataFrame, max_rows: int = 500) -> dict:
         "total_rows": total,
     }
 
+def _explanation_sentence(explanation: list, explanation_type: str) -> str:
+    """Turns a SHAP explanation (or global-importance fallback) into one plain-English
+    sentence for the narrative. Phrasing differs for per-prediction vs. global fallback,
+    since the latter isn't specific to this exact record and shouldn't be presented as if it were."""
+    if not explanation:
+        return ""
+    top = explanation[0]
+    if explanation_type == "per_prediction":
+        direction = top.get("direction", "influenced")
+        rest = explanation[1:3]
+        rest_str = "".join(
+            f", with {r['feature']} also having {'increased' if (r.get('contribution') or 0) > 0 else 'decreased'} it"
+            for r in rest[:1]
+        )
+        return (
+            f" This was driven primarily by **{top['feature']}**, which {direction} the prediction"
+            f"{rest_str}."
+        )
+    elif explanation_type == "global_fallback":
+        return (
+            f" Based on this model's overall feature importance (not specific to this exact record — "
+            f"a fast per-prediction explanation wasn't available for this model type), "
+            f"**{top['feature']}** is typically the strongest driver."
+        )
+    return ""
+
+
 def extract_metrics(df: pd.DataFrame) -> dict:
     if df is None or df.empty or len(df) > 20:
         return {}
@@ -217,8 +244,17 @@ class AnalyticsDispatcher:
         # incorrectly route to point-classification instead of SQL/training.
         if has_action_word and has_numeric_value:
             for label_col in self.classifiers.keys():
-                label_words = label_col.replace("_", " ").lower()
-                if label_words and label_words in q_lower:
+                # Match on individual underscore-separated words (each checked as a
+                # substring), not the whole phrase — a column named "emp_category"
+                # must still match natural phrasing like "employee category", where
+                # "emp" is a substring of "employee" but "emp category" as a literal
+                # phrase never appears. Whole-phrase matching silently failed on any
+                # abbreviated column name, which meant the routing check could NEVER
+                # succeed for that column — every question fell through to the LLM
+                # classifier and got treated as a fresh training request instead of
+                # reusing the already-trained model.
+                label_parts = [p for p in label_col.lower().split("_") if p]
+                if label_parts and all(part in q_lower for part in label_parts):
                     matched_label_col = label_col
                     break
 
@@ -275,9 +311,12 @@ class AnalyticsDispatcher:
                         f"Based on the trained classifier for **{matched_label_col}**, this record is "
                         f"predicted as **{label}** with {conf:.1f}% confidence. Probability Matrix: [ {matrix} ]"
                     )
+                    narrative += _explanation_sentence(result.get("explanation"), result.get("explanation_type"))
                     if result.get("defaulted_fields"):
                         narrative += f" ⚠️ {result['warning']}"
                     response["stat_narrative"] = narrative
+                    response["explanation"]      = result.get("explanation")
+                    response["explanation_type"] = result.get("explanation_type")
 
                     extracted = result["extracted_features"]
                     response["columns"] = list(extracted.keys())
@@ -318,9 +357,12 @@ class AnalyticsDispatcher:
                         f"Based on the trained Random Forest model, this customer profile belongs to the **{persona}** persona "
                         f"with {conf:.1f}% confidence. Probability Matrix: [ {matrix} ]"
                     )
+                    narrative += _explanation_sentence(result.get("explanation"), result.get("explanation_type"))
                     if result.get("defaulted_fields"):
                         narrative += f" ⚠️ {result['warning']}"
                     response["stat_narrative"] = narrative
+                    response["explanation"]      = result.get("explanation")
+                    response["explanation_type"] = result.get("explanation_type")
 
                     # 3. Feed the Data Table (Proves to the user what the LLM extracted)
                     extracted = result["extracted_features"]
@@ -539,6 +581,10 @@ class AnalyticsDispatcher:
                 if not feature_cols:
                     feature_cols = df_clean.columns.tolist()
 
+                # Explicit context in the question wins if present; otherwise
+                # fall back to whatever was set once via the UI at upload time.
+                # Domain context, if the user included it directly in the question
+                # (e.g. "Segment by X — this is telecom resourcing data").
                 domain_context = intent.get("domain_context")
                 result = self.cluster_engine.run(df_clean, feature_cols, domain_context=domain_context)
 
@@ -565,6 +611,8 @@ class AnalyticsDispatcher:
                 response["clustering_leaderboard"] = meta.get("clustering_leaderboard", [])
                 response["classifier_leaderboard"]  = meta.get("classifier_leaderboard", [])
                 response["classifier_model"]        = meta.get("classifier_model")
+                response["classifier_skipped_reason"] = meta.get("classifier_skipped_reason")
+                response["kprototypes_note"]        = meta.get("kprototypes_note")
 
                 if fi_df is not None:
                     response["feature_importance"] = {
@@ -629,6 +677,7 @@ class AnalyticsDispatcher:
                 response["confusion_matrix"]   = {"classes": meta["classes"], "matrix": meta["confusion_matrix"]}
                 response["label_distribution"] = meta["label_distribution"]
                 response["classifier_leaderboard"] = meta.get("classifier_leaderboard", [])
+                response["classifier_skipped_reason"] = meta.get("classifier_skipped_reason")
 
                 if fi_df is not None:
                     response["feature_importance"] = {

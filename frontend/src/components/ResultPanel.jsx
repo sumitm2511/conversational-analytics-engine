@@ -119,6 +119,37 @@ export default function ResultPanel({ result, sessionId, onFollowUp }) {
               <div className="summary-tab">
                 {insights.summary && <div className="insight-strip"><span className="insight-icon">✦</span><span className="insight-text" style={{ fontSize: "14px", lineHeight: "1.6" }}>{insights.summary}</span></div>}
                 {result.stat_narrative && <div className="insight-strip secondary"><span className="insight-icon">∿</span><span className="insight-text" style={{ fontSize: "14px", lineHeight: "1.6" }}>{result.stat_narrative}</span></div>}
+
+                {/* Per-prediction explanation (SHAP or global-importance fallback) */}
+                {result.explanation?.length > 0 && (
+                  <div className="forecast-leaderboard" style={{ marginTop: "16px", background: "#f8fafc", padding: "16px", borderRadius: "8px", border: "1px solid #e2e8f0" }}>
+                    <h4 style={{ margin: "0 0 12px 0", color: "#0f172a", fontSize: "14px" }}>
+                      🔍 {result.explanation_type === "per_prediction" ? "Why This Prediction" : "Typical Drivers (general, not specific to this record)"}
+                    </h4>
+                    <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "13px", textAlign: "left" }}>
+                      <thead>
+                        <tr style={{ borderBottom: "2px solid #cbd5e1", color: "#64748b" }}>
+                          <th style={{ padding: "8px" }}>Feature</th>
+                          <th style={{ padding: "8px" }}>{result.explanation_type === "per_prediction" ? "Contribution" : "Importance"}</th>
+                          {result.explanation_type === "per_prediction" && <th style={{ padding: "8px" }}>Direction</th>}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {result.explanation.map((row, i) => (
+                          <tr key={i} style={{ borderBottom: "1px solid #e2e8f0" }}>
+                            <td style={{ padding: "10px 8px", color: "#0f172a" }}>{row.feature}</td>
+                            <td style={{ padding: "10px 8px" }}>{row.contribution}</td>
+                            {result.explanation_type === "per_prediction" && (
+                              <td style={{ padding: "10px 8px", color: row.direction === "increased" ? "#059669" : "#DC2626" }}>
+                                {row.direction === "increased" ? "↑ increased" : "↓ decreased"}
+                              </td>
+                            )}
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
                 {insights.insights?.length > 0 && (
                   <div className="insight-bullets">
                     {insights.insights.map((ins, i) => <div key={i} className="insight-bullet"><span className="bullet-dot" style={{ background: color }} /><span style={{ fontSize: "14px" }}>{ins}</span></div>)}
@@ -258,6 +289,22 @@ export default function ResultPanel({ result, sessionId, onFollowUp }) {
                   </div>
                 )}
 
+                {/* Point 10: when the tournament couldn't run (e.g. too few samples in
+                    the smallest class/cluster) it falls back to a single default model
+                    silently unless we explain why — this replaces what would otherwise
+                    just be an empty leaderboard with no context. */}
+                {result.type === "clustering" && !(result.classifier_leaderboard?.length > 0) && result.classifier_skipped_reason && (
+                  <div className="forecast-leaderboard" style={{ marginTop: "16px", background: "#FFFBEB", padding: "14px 16px", borderRadius: "8px", border: "1px solid #FDE68A" }}>
+                    <div style={{ fontSize: "13px", color: "#92400E", display: "flex", gap: "8px", alignItems: "flex-start" }}>
+                      <span>⚠️</span>
+                      <span>
+                        <strong>Model comparison skipped for the point-classifier: </strong>
+                        {result.classifier_skipped_reason} A single default model ({result.classifier_model || "Random Forest"}) was used instead.
+                      </span>
+                    </div>
+                  </div>
+                )}
+
                 {/* Supervised classification model tournament */}
                 {result.type === "classification" && result.classifier_leaderboard?.length > 0 && (
                   <div className="forecast-leaderboard" style={{ marginTop: "24px", background: "#f8fafc", padding: "16px", borderRadius: "8px", border: "1px solid #e2e8f0" }}>
@@ -295,6 +342,19 @@ export default function ResultPanel({ result, sessionId, onFollowUp }) {
                     <p style={{ margin: "12px 0 0 0", fontSize: "11px", color: "#64748b", fontStyle: "italic" }}>
                       Selected by weighted F1 on held-out cross-validation, not just raw accuracy — more robust to class imbalance.
                     </p>
+                  </div>
+                )}
+
+                {result.type === "classification" && !(result.classifier_leaderboard?.length > 0) && result.classifier_skipped_reason && (
+                  <div className="forecast-leaderboard" style={{ marginTop: "24px", background: "#FFFBEB", padding: "14px 16px", borderRadius: "8px", border: "1px solid #FDE68A" }}>
+                    <div style={{ fontSize: "13px", color: "#92400E", display: "flex", gap: "8px", alignItems: "flex-start" }}>
+                      <span>⚠️</span>
+                      <span>
+                        <strong>Model comparison skipped: </strong>
+                        {result.classifier_skipped_reason} A single default model ({result.metrics?.Model || "Random Forest"}) was used instead —
+                        treat this result's accuracy with extra caution given the limited data.
+                      </span>
+                    </div>
                   </div>
                 )}
 
