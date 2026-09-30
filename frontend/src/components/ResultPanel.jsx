@@ -18,6 +18,34 @@ const FOLLOWUPS = {
   classification: ["Show confusion matrix breakdown", "Which features matter most?", "Classify a new record", "Show class distribution"],
 }
 
+// Structural styles for the Insights tab. Deliberately inline rather than
+// added to the stylesheet: the previous Insights tab used classNames
+// ("insights-full", "insight-section", "insight-section-title") that were
+// never defined anywhere in App.css, which is why it rendered as flat,
+// unstyled text. Everything possible below instead reuses classes that
+// already ARE styled elsewhere (insight-strip, anomaly-flags, followup-chip)
+// so the tab visually matches the rest of the card; these few objects only
+// cover the genuinely new structural pieces (section labels, numbered
+// finding cards, the next-questions grid) that have no existing equivalent.
+const INSIGHTS_SECTION_TITLE_STYLE = {
+  fontSize: "12px",
+  fontWeight: 700,
+  color: "#64748B",
+  textTransform: "uppercase",
+  letterSpacing: "0.05em",
+  marginBottom: "10px",
+}
+
+const FINDING_CARD_STYLE = {
+  display: "flex",
+  gap: "12px",
+  alignItems: "flex-start",
+  background: "#F8FAFC",
+  border: "1px solid #F1F5F9",
+  borderRadius: "10px",
+  padding: "12px 14px",
+}
+
 export default function ResultPanel({ result, sessionId, onFollowUp }) {
   const [activeTab,    setActiveTab]    = useState("Summary")
   const [chartData,    setChartData]    = useState(result.chart || null)
@@ -46,8 +74,24 @@ export default function ResultPanel({ result, sessionId, onFollowUp }) {
   )
 
   const type   = result.type || "sql"
-  const chips  = FOLLOWUPS[type] || FOLLOWUPS.sql
   const color  = INTENT_COLORS[type] || "#6366F1"
+
+  const insights    = result.insights || {}
+  const kpis        = insights.kpis || {}
+  const hasKpis     = Object.keys(kpis).length > 0
+  const hasMetrics  = result.metrics && Object.keys(result.metrics).length > 0
+
+  // Prefer the genuinely personalized, LLM-generated follow-ups (grounded
+  // in this specific question/data — the same ones shown in the Insights
+  // tab) for the always-visible footer row too, instead of the static
+  // per-intent-type list, which showed the exact same 4 questions on every
+  // single query of a given type regardless of what was actually asked.
+  // Falls back to the static list only when the backend didn't return any
+  // (e.g. an errored/empty insights response).
+  const personalizedChips = Array.isArray(insights.next_questions) && insights.next_questions.length > 0
+    ? insights.next_questions
+    : null
+  const chips = personalizedChips || FOLLOWUPS[type] || FOLLOWUPS.sql
 
   const tabs = ["Summary"]
   if (chartData)     tabs.push("Chart")
@@ -55,10 +99,12 @@ export default function ResultPanel({ result, sessionId, onFollowUp }) {
   if (result.sql)    tabs.push("SQL")
   if (result.insights) tabs.push("Insights")
 
-  const insights    = result.insights || {}
-  const kpis        = insights.kpis || {}
-  const hasKpis     = Object.keys(kpis).length > 0
-  const hasMetrics  = result.metrics && Object.keys(result.metrics).length > 0
+  const hasAnomalyFlags   = insights.anomalies?.filter(Boolean).length > 0
+  const hasInsightsContent =
+    !!insights.summary ||
+    (insights.insights?.length > 0) ||
+    hasAnomalyFlags ||
+    (insights.next_questions?.length > 0)
 
   async function handleRequestChart(chartType) {
     if (!sessionId) return
@@ -428,11 +474,87 @@ export default function ResultPanel({ result, sessionId, onFollowUp }) {
             )}
       
             {activeTab === "Insights" && (
-              <div className="insights-full">
-                {insights.summary && <div className="insight-section"><div className="insight-section-title">Summary</div><p style={{ fontSize: "14px" }}>{insights.summary}</p></div>}
-                {insights.insights?.length > 0 && <div className="insight-section"><div className="insight-section-title">Key Findings</div>{insights.insights.map((ins, i) => <div key={i} className="insight-bullet"><span className="bullet-dot" style={{ background: color }} /><span style={{ fontSize: "14px" }}>{ins}</span></div>)}</div>}
-                {insights.anomalies?.filter(Boolean).length > 0 && <div className="insight-section"><div className="insight-section-title">⚡ Anomalies & Flags</div>{insights.anomalies.map((a, i) => <div key={i} className="anomaly-flag">{a}</div>)}</div>}
-                {insights.next_questions?.length > 0 && <div className="insight-section"><div className="insight-section-title">Recommended Next Queries</div>{insights.next_questions.map((q, i) => <button key={i} className="followup-chip" onClick={() => onFollowUp && onFollowUp(q)}>{q}</button>)}</div>}
+              <div style={{ padding: "20px 18px", display: "flex", flexDirection: "column", gap: "22px" }}>
+
+                {/* Executive Summary — reuses the already-styled purple
+                    insight-strip, same as the Summary tab, instead of the
+                    old unstyled "insight-section" wrapper. */}
+                {insights.summary && (
+                  <div>
+                    <div style={INSIGHTS_SECTION_TITLE_STYLE}>Executive Summary</div>
+                    <div className="insight-strip">
+                      <span className="insight-icon">✦</span>
+                      <span className="insight-text" style={{ fontSize: "14px", lineHeight: "1.6" }}>{insights.summary}</span>
+                    </div>
+                  </div>
+                )}
+
+                {/* Key Findings — each finding gets its own numbered card
+                    instead of a flat bullet, so a list of 3-5 findings
+                    reads as distinct, scannable items rather than one
+                    unbroken block of text. */}
+                {insights.insights?.length > 0 && (
+                  <div>
+                    <div style={INSIGHTS_SECTION_TITLE_STYLE}>🔍 Key Findings</div>
+                    <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
+                      {insights.insights.map((ins, i) => (
+                        <div key={i} style={FINDING_CARD_STYLE}>
+                          <span style={{
+                            flexShrink: 0, width: "22px", height: "22px", borderRadius: "50%",
+                            background: color + "18", color, fontSize: "11px", fontWeight: 700,
+                            display: "flex", alignItems: "center", justifyContent: "center",
+                          }}>
+                            {i + 1}
+                          </span>
+                          <span style={{ fontSize: "14px", color: "#334155", lineHeight: "1.55" }}>{ins}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {/* Anomalies & Flags — reuses the already-styled red
+                    anomaly-flags card, same as the Summary tab. */}
+                {hasAnomalyFlags && (
+                  <div className="anomaly-flags" style={{ margin: 0 }}>
+                    <div className="anomaly-flags-title">⚡ Anomalies &amp; Flags</div>
+                    {insights.anomalies.map((a, i) => <div key={i} className="anomaly-flag">{a}</div>)}
+                  </div>
+                )}
+
+                {/* Recommended Next Queries — same followup-chip pill style
+                    used elsewhere in the app, but arranged in a responsive
+                    grid here instead of a single scrolling row, since this
+                    tab has the vertical space for a proper grid layout. */}
+                {insights.next_questions?.length > 0 && (
+                  <div>
+                    <div style={INSIGHTS_SECTION_TITLE_STYLE}>💡 Recommended Next Queries</div>
+                    <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(260px, 1fr))", gap: "8px" }}>
+                      {insights.next_questions.map((q, i) => (
+                        <button
+                          key={i}
+                          className="followup-chip"
+                          style={{
+                            display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: "8px",
+                            width: "100%", textAlign: "left",
+                            whiteSpace: "normal", wordBreak: "break-word", lineHeight: "1.4",
+                            padding: "10px 14px",
+                          }}
+                          onClick={() => onFollowUp && onFollowUp(q)}
+                        >
+                          <span>{q}</span>
+                          <span style={{ color: "#94A3B8", flexShrink: 0 }}>→</span>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {!hasInsightsContent && (
+                  <div style={{ textAlign: "center", padding: "40px 20px", color: "#94A3B8", fontSize: "13px" }}>
+                    No additional insights available for this query.
+                  </div>
+                )}
               </div>
             )}
           </div>

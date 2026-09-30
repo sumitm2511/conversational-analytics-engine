@@ -18,6 +18,11 @@ CLUSTER ENGINE (V20 Upgrade)
   [NEW]  Replaced PCA with UMAP for superior non-linear 2D projection.
   [NEW]  Native noise isolation (removed redundant Isolation Forest).
   [NEW]  Graceful fallbacks: Reverts to K-Means/PCA if libraries are missing or data is too uniform.
+
+LLM BACKEND
+  [MIGRATED] ClusterEngine and SupervisedClassifierEngine now call EricAI via
+             llm_client.chat_completion_json() instead of a lazily-initialized
+             Groq client. See llm_client.py for auth/retry/JSON-repair details.
 """
 
 import warnings
@@ -30,6 +35,8 @@ from typing import Optional, Dict, Tuple, List
 import logging
 logging.getLogger("cmdstanpy").setLevel(logging.ERROR)
 logging.getLogger("prophet").setLevel(logging.ERROR)
+
+from llm_client import chat_completion_json, MODEL_STRUCTURED
 
 
 # ── Shared helpers ─────────────────────────────────────────────────────────────
@@ -1493,10 +1500,12 @@ class ClusterEngine:
     - UMAP for 2D topological mapping.
     - Post-hoc Random Forest Classifier for new-point classification.
     - Consistent categorical encoding via stored category levels (bug fix).
+
+    LLM calls (auto-labeling, NL feature extraction) go through EricAI via
+    llm_client.chat_completion_json() — see that module for auth/retry/JSON-repair.
     """
 
     def __init__(self):
-        self._groq_client  = None
         # ── State persisted across run() → predict_point() calls ──
         self.scaler          = None
         self.encoded_cols    = None   # column order the model was trained on
@@ -1510,22 +1519,6 @@ class ClusterEngine:
         self.explainer_type = None    # "tree" | "linear" | None
         self._background_sample = None   # small sample of scaled training data, needed by LinearExplainer
         self.feature_importance_global = None   # fallback explanation when no fast SHAP explainer applies
-
-    # ── Groq lazy init (unchanged) ─────────────────────────────────────────────
-
-    def _get_groq_client(self):
-        if self._groq_client is not None:
-            return self._groq_client
-        try:
-            import os
-            from groq import Groq
-            key = os.getenv("GROQ_API_KEY")
-            if not key:
-                return None
-            self._groq_client = Groq(api_key=key)
-            return self._groq_client
-        except Exception:
-            return None
 
     def _compute_categorical_distinguishing_features(self, valid_clusters: "pd.DataFrame", cat_cols: list, top_n: int = 2) -> dict:
         """
@@ -1610,11 +1603,6 @@ class ClusterEngine:
         return result
 
     def _generate_labels(self, profiles: dict, distinguishing: dict = None, domain_context: str = None) -> dict:
-        import json
-        client = self._get_groq_client()
-        if client is None:
-            return {}
-
         distinguishing = distinguishing or {}
         context_line = f"\nDomain context provided by the user: {domain_context}\n" if domain_context else ""
 
@@ -1623,9 +1611,9 @@ class ClusterEngine:
             f"{context_line}"
             "Below is what makes each cluster DIFFERENT from the overall dataset average — use these "
             "distinguishing factors as the PRIMARY basis for naming, not raw averages alone:\n\n"
-            f"{json.dumps(distinguishing, indent=2)}\n\n"
+            f"{__import__('json').dumps(distinguishing, indent=2)}\n\n"
             "For additional grounding, here are the raw average feature values per cluster:\n"
-            f"{json.dumps(profiles, indent=2)}\n\n"
+            f"{__import__('json').dumps(profiles, indent=2)}\n\n"
             "Naming rules:\n"
             "- Give each cluster a sharp, specific, 2-4 word 'Persona Name' that reflects its most "
             "distinguishing factor(s) — not a generic catch-all label.\n"
@@ -1640,13 +1628,11 @@ class ClusterEngine:
             "(e.g., 'Cluster 0') and values are the persona name strings. No markdown, no explanations."
         )
         try:
-            resp = client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
+            labels = chat_completion_json(
                 messages=[{"role": "user", "content": prompt}],
+                model=MODEL_STRUCTURED,
                 temperature=0.3,
-                response_format={"type": "json_object"},
             )
-            labels = json.loads(resp.choices[0].message.content.strip())
             return self._dedupe_labels(labels)
         except Exception as e:
             print(f"[ClusterEngine] Auto-labeling failed: {e}")
@@ -2162,7 +2148,7 @@ class ClusterEngine:
             )
 
         # Two-step naming: compute what's actually DISTINCTIVE about each
-        # cluster (vs. the overall dataset average) before asking Groq to
+        # cluster (vs. the overall dataset average) before asking the LLM to
         # name it — raw averages alone tend to produce vague names like
         # "Medium Users". _generate_labels() also still guarantees unique
         # persona names via _dedupe_labels().
@@ -2333,20 +2319,13 @@ class ClusterEngine:
     # ── predict_point_from_text() ──────────────────────────────────────────────
 
     def predict_point_from_text(self, question: str) -> dict:
-        """Extract features from natural language, then classify."""
+        """Extract features from natural language (via EricAI), then classify."""
         if self.clf is None or self.scaler is None:
             return {
                 "error": (
                     "I need to cluster your data first before I can classify "
                     "individual users. Try asking me to segment the data first!"
                 )
-            }
-
-        import json
-        client = self._get_groq_client()
-        if client is None:
-            return {
-                "error": "Groq API key required for natural language feature extraction."
             }
 
         # Tell the LLM what types each feature expects
@@ -2371,13 +2350,11 @@ class ClusterEngine:
         )
 
         try:
-            resp = client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
+            point_dict = chat_completion_json(
                 messages=[{"role": "user", "content": prompt}],
+                model=MODEL_STRUCTURED,
                 temperature=0.0,
-                response_format={"type": "json_object"},
             )
-            point_dict = json.loads(resp.choices[0].message.content.strip())
 
             # Remove null values — predict_point handles missing feature check
             point_dict = {k: v for k, v in point_dict.items() if v is not None}
@@ -2406,10 +2383,12 @@ class SupervisedClassifierEngine:
     Mirrors ClusterEngine's session-scoped state pattern (trained model lives
     on the instance, so each session/label-column needs its own instance —
     see main.py's per-session `classifiers` dict).
+
+    LLM calls (natural language feature extraction) go through EricAI via
+    llm_client.chat_completion_json().
     """
 
     def __init__(self):
-        self._groq_client       = None
         self.scaler             = None
         self.encoded_cols       = None   # column order the model was trained on
         self.feature_cols       = None   # original feature columns requested
@@ -2424,22 +2403,6 @@ class SupervisedClassifierEngine:
         self.explainer_type = None
         self._background_sample = None
         self.feature_importance_global = None
-
-    # ── Groq lazy init (same pattern as ClusterEngine) ──────────────────────────
-
-    def _get_groq_client(self):
-        if self._groq_client is not None:
-            return self._groq_client
-        try:
-            import os
-            from groq import Groq
-            key = os.getenv("GROQ_API_KEY")
-            if not key:
-                return None
-            self._groq_client = Groq(api_key=key)
-            return self._groq_client
-        except Exception:
-            return None
 
     # ── Consistent encoding helper (same mechanism as ClusterEngine) ────────────
 
@@ -2733,8 +2696,8 @@ class SupervisedClassifierEngine:
     # ── predict_point_from_text() ──────────────────────────────────────────────
 
     def predict_point_from_text(self, question: str) -> dict:
-        """Extract features from natural language, then classify against the
-        trained label. Mirrors ClusterEngine.predict_point_from_text()."""
+        """Extract features from natural language (via EricAI), then classify
+        against the trained label. Mirrors ClusterEngine.predict_point_from_text()."""
         if self.clf is None or self.scaler is None:
             return {
                 "error": (
@@ -2742,11 +2705,6 @@ class SupervisedClassifierEngine:
                     "Try asking a classification question before predicting individual records!"
                 )
             }
-
-        import json
-        client = self._get_groq_client()
-        if client is None:
-            return {"error": "Groq API key required for natural language feature extraction."}
 
         feature_type_hints = []
         for col in self.feature_cols:
@@ -2769,13 +2727,11 @@ class SupervisedClassifierEngine:
         )
 
         try:
-            resp = client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
+            point_dict = chat_completion_json(
                 messages=[{"role": "user", "content": prompt}],
+                model=MODEL_STRUCTURED,
                 temperature=0.0,
-                response_format={"type": "json_object"},
             )
-            point_dict = json.loads(resp.choices[0].message.content.strip())
             point_dict = {k: v for k, v in point_dict.items() if v is not None}
 
             prediction = self.predict_point(point_dict)

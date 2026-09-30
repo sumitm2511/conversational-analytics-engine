@@ -30,9 +30,7 @@ function AnimatedNumber({ target }) {
 }
 
 export default function KPIBar({ schema }) {
-  if (!schema) return null
-
-  const tableDetails = Object.values(schema.table_details || {})
+  const tableDetails = schema ? Object.values(schema.table_details || {}) : []
 
   const totalRows   = tableDetails.reduce((sum, t) => sum + (t.rows || 0), 0)
   const totalCols   = tableDetails.reduce((sum, t) => sum + (t.columns?.length || 0), 0)
@@ -54,6 +52,20 @@ export default function KPIBar({ schema }) {
     : health >= 70 ? "health-warn" : "health-bad"
 
   const allWarnings = tableDetails.flatMap(t => t.health?.warnings || [])
+
+  // Dismissing hides the warnings panel without touching the backend or the
+  // underlying health data — it's purely "stop taking up space right now."
+  // Keyed to the ACTUAL warning content (not just a boolean) so a genuinely
+  // new problem showing up later — a fresh upload with different issues, or
+  // the same session's warnings changing after a combine/remove — un-hides
+  // the panel again instead of staying permanently dismissed for the rest
+  // of the session. Re-dismissing the exact same set of warnings keeps it
+  // hidden, so switching tabs/tables doesn't make it reappear for no reason.
+  const warningsKey = allWarnings.join("|")
+  const [dismissedKey, setDismissedKey] = useState(null)
+  const isDismissed = dismissedKey === warningsKey && warningsKey !== ""
+
+  if (!schema) return null
 
   const kpis = [
     { icon: "☰", label: "Total Rows",  value: totalRows.toLocaleString(), raw: totalRows },
@@ -84,9 +96,19 @@ export default function KPIBar({ schema }) {
         ))}
       </div>
 
-      {allWarnings.length > 0 && (
+      {allWarnings.length > 0 && !isDismissed && (
         <div className="health-warnings-container">
-          <div className="health-warnings-title">Data Health Warnings</div>
+          <div className="health-warnings-header">
+            <div className="health-warnings-title">Data Health Warnings</div>
+            <button
+              className="health-warnings-dismiss"
+              onClick={() => setDismissedKey(warningsKey)}
+              title="Dismiss"
+              aria-label="Dismiss data health warnings"
+            >
+              ✕
+            </button>
+          </div>
           {allWarnings.map((w, i) => (
             <div key={i} className="health-warning-item">⚠ {w}</div>
           ))}

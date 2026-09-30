@@ -3,19 +3,24 @@ insight_engine.py  —  Upgraded
 - Intent-specific prompts for forecast / trend / anomaly / regression / sql / classification
 - Passes statistical metadata (CAGR, trend_strength, anomaly narrative) to the LLM
 - Returns richer structure with kpis, narrative, and confidence
+
+Migrated from Groq to EricAI via llm_client.chat_completion().
 """
 
-import os
 import json
 import re
+import traceback
 import pandas as pd
-from groq import Groq
+
+from llm_client import chat_completion, MODEL_INSIGHT
 
 
 class InsightEngine:
 
     def __init__(self):
-        self.client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+        # No client to construct up front — llm_client manages the EricAI
+        # client/token lifecycle centrally.
+        pass
 
     # ── Public API ─────────────────────────────────────────────────────────────
 
@@ -26,7 +31,8 @@ class InsightEngine:
         data: pd.DataFrame = None,
         metrics: dict = None,
         extra_context: str = "",
-        stat_meta: dict = None,       # ← NEW: pass forecast/trend/anomaly meta here
+        stat_meta: dict = None,       # forecast/trend/anomaly meta
+        total_rows: int = None,       # TRUE row count of the full result, before any sample truncation
     ) -> dict:
         """
         Returns:
@@ -35,18 +41,48 @@ class InsightEngine:
             "insights":       ["bullet 1", ...],
             "anomalies":      ["flag 1", ...],
             "next_questions": ["follow-up Q1", ...],
-            "kpis":           {"CAGR": "12.4%", ...}   ← NEW
+            "kpis":           {"CAGR": "12.4%", ...}
           }
+
+        `total_rows` should be the query's REAL total row count (e.g.
+        main.py's response["total_rows"], computed before any truncation) —
+        NOT inferred from len(data), since `data` itself may already be
+        capped (main.py passes df.head(200) for the sql/summary path).
+        Without this, the model has no way to know its data sample is
+        truncated and will report the SAMPLE SIZE as if it were the true
+        count — confirmed: a 30-row result produced a stated count of
+        exactly 15, the old _df_summary() truncation limit, not the real 30.
+
+        If `data` is empty, this short-circuits and returns a plain "no
+        records matched" result WITHOUT calling the LLM at all — an empty
+        result is exactly the case where a model tends to fabricate a
+        plausible-sounding narrative instead of reporting nothing was
+        found, since it has no real data grounding it (confirmed: a
+        genuinely empty result still produced a fully fabricated summary
+        with specific fake numbers).
         """
-        data_str    = self._df_summary(data) if data is not None else "No data."
+        if data is None or data.empty:
+            return {
+                "summary":        "No records matched this query.",
+                "insights":       [],
+                "anomalies":      [],
+                "next_questions": [],
+                "kpis":           {},
+            }
+
+        sample_size = min(len(data), 15)
+        true_total  = total_rows if total_rows is not None else len(data)
+
+        data_str    = self._df_summary(data)
         metrics_str = json.dumps(metrics or {}, default=str)
         meta_str    = json.dumps(stat_meta or {}, default=str)
 
         prompt = self._build_prompt(
-            question, intent_type, data_str, metrics_str, meta_str, extra_context
+            question, intent_type, data_str, metrics_str, meta_str, extra_context,
+            true_total, sample_size,
         )
 
-        return self._call_llm(prompt)
+        return self._call_llm(prompt, debug_context=f"generate(question={question!r}, intent_type={intent_type!r})")
 
     def summarize_dataset(self, df: pd.DataFrame, schema: str) -> dict:
         """Called on file upload — full dataset overview."""
@@ -83,12 +119,12 @@ Respond ONLY with a JSON object — no markdown, no explanation:
   "kpis": {{}}
 }}
 """
-        return self._call_llm(prompt)
+        return self._call_llm(prompt, debug_context="summarize_dataset()")
 
     # ── Prompt builder ─────────────────────────────────────────────────────────
 
     def _build_prompt(self, question, intent_type, data_str, metrics_str,
-                      meta_str, extra_context) -> str:
+                      meta_str, extra_context, true_total, sample_size) -> str:
 
         intent_instructions = {
             "forecast": """
@@ -153,13 +189,21 @@ You are a senior business analyst presenting findings to the executive team.
 User asked: "{question}"
 Query type: {intent_type}
 
+ROW COUNT — GROUND TRUTH (read this before anything else):
+This query matched exactly {true_total} row(s) in total. The "Data sample" below shows only
+the first {sample_size} of those {true_total} rows, for context only — it is NOT the complete
+result. Whenever your summary, insights, or kpis state a count, total, or "number of X", you
+MUST use {true_total} (or a figure computed from the Metrics/Statistical metadata below) —
+NEVER count rows in the data sample yourself, since the sample is truncated at {sample_size}
+and does not reflect the true total whenever {true_total} is larger than that.
+
 Statistical metadata (CAGR, trend strength, anomaly counts, model info):
 {meta_str}
 
 Metrics:
 {metrics_str}
 
-Data sample:
+Data sample ({sample_size} of {true_total} total rows):
 {data_str}
 
 Additional context: {extra_context}
@@ -188,9 +232,17 @@ Respond ONLY with a JSON object — no markdown fences, no preamble:
 
 Rules:
 - Every insight must reference an actual number from the data or metadata
+- Any count, total, or "number of X" you state MUST equal {true_total} exactly — never a
+  number you arrived at by counting rows in the truncated data sample above
+- Do NOT reinterpret, relabel, or assign new meaning to a metric — describe it
+  using the same concept its name already indicates. A metric literally named
+  something like "Employee Id" is an identifier, never a count or total, no
+  matter what its numeric value happens to look like.
 - Keep summary to 2-3 sentences maximum
 - next_questions should be natural follow-up analytics queries the user can ask
-- kpis should surface 2-4 headline numbers (e.g. CAGR, total, peak, anomaly count)
+- kpis should surface 2-4 headline numbers (e.g. CAGR, total, peak, anomaly
+  count) — never invent a KPI by reinterpreting a metric whose own name
+  indicates it's an identifier/code rather than a real quantity
 """
 
     # ── Helpers ────────────────────────────────────────────────────────────────
@@ -203,17 +255,56 @@ Rules:
         except Exception:
             return "Data preview unavailable."
 
-    def _call_llm(self, prompt: str) -> dict:
+    def _extract_json(self, raw: str) -> dict:
+        """
+        Parses the LLM's response into a dict, tolerating the common ways a
+        model wraps JSON in extra text even when explicitly told not to:
+        - ```json fences (or bare ``` fences)
+        - leading/trailing prose ("Here is the analysis:\n{...}\nLet me know...")
+
+        Raises (doesn't swallow) if no valid JSON object can be recovered —
+        the caller is responsible for logging/handling that, so failures
+        stay visible instead of silently producing identical boilerplate
+        output on every call.
+        """
+        cleaned = re.sub(r"```json|```", "", raw).strip()
+
+        # Fast path: the whole cleaned string is valid JSON on its own.
         try:
-            resp = self.client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
+            return json.loads(cleaned)
+        except json.JSONDecodeError:
+            pass
+
+        # Fallback: pull out the first {...} object by brace-matching, in
+        # case the model added any text before/after the JSON despite being
+        # told not to — this is the part the previous version didn't do,
+        # so any such text caused EVERY call to silently fail and fall
+        # through to the generic "Analysis complete." placeholder.
+        start = cleaned.find("{")
+        if start == -1:
+            raise ValueError("No JSON object found in LLM response")
+
+        depth = 0
+        for i in range(start, len(cleaned)):
+            if cleaned[i] == "{":
+                depth += 1
+            elif cleaned[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    candidate = cleaned[start:i + 1]
+                    return json.loads(candidate)
+
+        raise ValueError("Unbalanced JSON object in LLM response")
+
+    def _call_llm(self, prompt: str, debug_context: str = "") -> dict:
+        try:
+            raw = chat_completion(
                 messages=[{"role": "user", "content": prompt}],
+                model=MODEL_INSIGHT,
                 temperature=0.2,
                 max_tokens=700,
             )
-            raw = resp.choices[0].message.content.strip()
-            raw = re.sub(r"```json|```", "", raw).strip()
-            result = json.loads(raw)
+            result = self._extract_json(raw)
             result.setdefault("summary", "Analysis complete.")
             result.setdefault("insights", [])
             result.setdefault("anomalies", [])
@@ -221,6 +312,14 @@ Rules:
             result.setdefault("kpis", {})
             return result
         except Exception as e:
+            # Previously this was a bare `except Exception: return <static dict>`
+            # with NO logging — meaning every failure (bad JSON, EricAI error,
+            # etc.) was invisible and produced the exact same generic Summary
+            # every time, no matter the question or data. Logging here is what
+            # actually lets you find the root cause in the server console the
+            # next time this fires.
+            print(f"[InsightEngine] LLM call failed ({debug_context}): {type(e).__name__}: {e}")
+            traceback.print_exc()
             return {
                 "summary":        "Analysis complete.",
                 "insights":       [],

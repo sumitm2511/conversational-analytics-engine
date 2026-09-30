@@ -1,12 +1,45 @@
-import os
-import json
 import re
-from groq import Groq
+
+from llm_client import chat_completion_json, MODEL_STRUCTURED
+
+# Explicit join-type mentions in the question ALWAYS override whatever the
+# LLM inferred — this is the "explicit mention wins" half of the join
+# decision. Checked as a defensive net after the LLM call, same pattern as
+# the schema-validation net below, since an instruction inside the prompt
+# alone isn't reliably followed 100% of the time.
+_EXPLICIT_JOIN_PATTERNS = [
+    (re.compile(r"\bleft\s+(outer\s+)?join\b", re.I), "left"),
+    (re.compile(r"\bright\s+(outer\s+)?join\b", re.I), "right"),
+    (re.compile(r"\bfull\s+(outer\s+)?join\b", re.I), "full"),
+    (re.compile(r"\binner\s+join\b", re.I), "inner"),
+]
+
+_VALID_JOIN_TYPES = {"inner", "left", "right", "full"}
+
+# Soft signal for outer-join intent that ISN'T a literal "left join" mention
+# — phrasing like "including departments with no employees" clearly implies
+# an outer join, but the LLM's own inference doesn't always catch it
+# reliably. Used only to correct an "inner" result, never to override an
+# explicit join-type mention (that's _EXPLICIT_JOIN_PATTERNS above, which
+# always wins outright) and never to force needs_join true on its own.
+_IMPLIED_OUTER_JOIN_PATTERNS = [
+    re.compile(r"\bwith no\b", re.I),
+    re.compile(r"\bwithout any\b", re.I),
+    re.compile(r"\beven (if|when|without)\b", re.I),
+    re.compile(r"\bwhether or not\b", re.I),
+    re.compile(r"\bincluding\b.{0,40}\bno\b", re.I),
+    re.compile(r"\bregardless of whether\b", re.I),
+    re.compile(r"\bmay not have\b", re.I),
+    re.compile(r"\bnever\b.{0,20}\b(placed|assigned|made|had)\b", re.I),
+]
+
 
 class IntentClassifier:
 
     def __init__(self):
-        self.client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+        # No client to construct up front — llm_client manages the EricAI
+        # client/token lifecycle centrally.
+        pass
 
     def classify(self, question: str, schema_info: str) -> dict:
         prompt = f"""
@@ -57,10 +90,44 @@ class IntentClassifier:
           telecom resource management data"), extract it verbatim here. Otherwise null. Do NOT invent
           domain context that wasn't stated by the user.
 
+        JOIN DECISION RULES (populate these regardless of type — matters most for "sql"/"summary",
+        but any type that reads from "tables" benefits from not pulling in an unneeded table):
+        - Set "needs_join" to true ONLY if answering the question genuinely requires columns that
+          live in MORE THAN ONE table. If every column needed already exists in a single table, set
+          "needs_join" to false and "tables" to just that one table — even if other tables are loaded
+          in this session, and even if the question MENTIONS a concept that lives elsewhere. Mentioning
+          something is not the same as needing its columns as output or as a filter: "show all
+          departments and their budget, including departments with no employees" needs ONLY
+          department + budget — if those already live together in one table, needs_join is FALSE, even
+          though the question says "employees". The word "employees" here describes what NOT to filter
+          out (don't drop budget-less-of-employees departments), it does not mean employee data is
+          actually required in the output. Before setting needs_join true, check: are the SPECIFIC
+          columns this question needs (as output or filter) actually missing from a single table? If
+          not, don't join.
+        - The "Possible Join Relationships" section of the schema above lists which columns are
+          actually shared between which tables — only ever join on a column listed there. Never
+          invent or assume a join column that isn't documented in the schema.
+        - If "needs_join" is true, set "join_type" to one of "inner" | "left" | "right" | "full":
+          - Default to "inner" (keep only rows that match in both tables) unless the question implies
+            otherwise.
+          - Use "left" when the question wants to keep every row from the first/primary table even
+            when there's no match in the other table. Watch for phrasing like this even when it
+            doesn't literally say "left join": "including departments with no employees", "customers
+            who have never placed an order", "X regardless of whether they have a matching Y", "X
+            even if there's no Y", "whether or not they have a Z". Any of these means do NOT use
+            inner join — an inner join would silently drop exactly the rows being asked to keep.
+          - Use "right" for the mirrored case (keep every row from the second table).
+          - Use "full" when the question wants every row from BOTH tables regardless of match.
+          - If the user's question explicitly names a join type ("left join", "outer join", "inner
+            join", "full join"), use EXACTLY that type — an explicit instruction always overrides
+            your own inference from the question's meaning.
+
         Return ONLY a valid JSON object matching this exact structure (use null for missing elements):
         {{
           "type": "sql" | "forecast" | "regression" | "trend" | "anomaly" | "summary" | "clustering" | "classification",
           "tables": ["<exact_table_name_1>"], 
+          "needs_join": <true_or_false>,
+          "join_type": "inner" | "left" | "right" | "full",
           "date_col": "<exact_schema_column_or_null>",
           "value_col": "<exact_schema_column_or_null>",
           "group_col": "<exact_schema_column_or_null>",
@@ -71,21 +138,19 @@ class IntentClassifier:
           "chart_type": "bar" | "line" | "scatter" | "pie" | "heatmap" | "histogram" | "auto"
         }}
         """
-        
+
         try:
-            resp = self.client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
+            result = chat_completion_json(
                 messages=[{"role": "user", "content": prompt}],
+                model=MODEL_STRUCTURED,
                 temperature=0,
-                response_format={"type": "json_object"} # Forces strict JSON output
             )
 
-            raw = resp.choices[0].message.content.strip()
-            result = json.loads(raw)
-            
             # Ensure required fields exist with safe defaults
             result.setdefault("type", "sql")
             result.setdefault("tables", [])
+            result.setdefault("needs_join", False)
+            result.setdefault("join_type", "inner")
             result.setdefault("chart_type", "auto")
             result.setdefault("date_col", None)
             result.setdefault("value_col", None)
@@ -98,15 +163,17 @@ class IntentClassifier:
             # Defensive net: don't rely on the prompt alone — LLMs sometimes
             # split clustering/regression columns across value_col/group_col
             # instead of feature_cols regardless of instructions. Fix it here.
-            result = self._consolidate_fields(result, schema_info)
+            result = self._consolidate_fields(result, schema_info, question)
 
             return result
-            
+
         except Exception as e:
             print(f"Intent Classification Error: {e}")
             return {
                 "type": "sql",
                 "tables": [],
+                "needs_join": False,
+                "join_type": "inner",
                 "chart_type": "auto",
                 "date_col": None,
                 "value_col": None,
@@ -117,9 +184,16 @@ class IntentClassifier:
                 "periods": 12
             }
 
-    def _consolidate_fields(self, result: dict, schema_info: str) -> dict:
+    def _detect_explicit_join_type(self, question: str):
+        """Returns the join type literally named in the question, or None."""
+        for pattern, jtype in _EXPLICIT_JOIN_PATTERNS:
+            if pattern.search(question):
+                return jtype
+        return None
+
+    def _consolidate_fields(self, result: dict, schema_info: str, question: str) -> dict:
         """
-        Applies two safety nets on top of whatever the LLM returned:
+        Applies safety nets on top of whatever the LLM returned:
 
         1. Type-specific consolidation — if the model split clustering columns
            across value_col/group_col/etc. instead of putting them all in
@@ -129,6 +203,9 @@ class IntentClassifier:
            doesn't actually exist in schema_info, rather than letting it
            silently fail downstream (e.g. get filtered out of safe_cols in
            main.py with no explanation).
+        3. Explicit join-type override — if the question itself names a join
+           type, that wins outright over whatever the model inferred.
+        4. needs_join sanity check — never true with fewer than 2 tables.
         """
 
         # ── 1a. Clustering: consolidate stray fields into feature_cols ──────
@@ -165,6 +242,34 @@ class IntentClassifier:
                 result["feature_cols"] = [
                     c for c in result["feature_cols"] if c in valid_cols
                 ] or None
+
+        # ── 3. Explicit join-type mention in the question always wins ───────
+        explicit_join = self._detect_explicit_join_type(question)
+        if explicit_join:
+            result["join_type"] = explicit_join
+            if len(result.get("tables") or []) >= 2:
+                result["needs_join"] = True
+        elif result.get("join_type") not in _VALID_JOIN_TYPES:
+            result["join_type"] = "inner"
+
+        # ── 3b. Soft nudge: strongly-implied outer-join phrasing, if the
+        # model still came back with "inner" despite it. Never overrides an
+        # explicit mention (already handled above) and never turns on
+        # needs_join by itself — only corrects the TYPE when a join was
+        # already decided to be needed. This is what catches phrasing like
+        # "including departments with no employees" when the model's own
+        # inference missed it and defaulted to its "inner" baseline.
+        if (
+            not explicit_join
+            and result.get("needs_join")
+            and result.get("join_type") == "inner"
+            and any(p.search(question) for p in _IMPLIED_OUTER_JOIN_PATTERNS)
+        ):
+            result["join_type"] = "left"
+
+        # ── 4. needs_join only makes sense with 2+ tables ────────────────────
+        if len(result.get("tables") or []) < 2:
+            result["needs_join"] = False
 
         return result
 

@@ -17,20 +17,28 @@ const ChatPanel = forwardRef(function ChatPanel(
   const [input, setInput] = useState("")
 
   useImperativeHandle(ref, () => ({
-    setQuestion: (q) => { setInput(q) }
+    setQuestion: (q) => { setInput(q) },
+    // Re-runs a question that previously paused for a join clarification —
+    // either with the user's explicit choice (extra.join_override) or with
+    // skip_join_clarification set (so the backend proceeds with its own
+    // decision instead of pausing to ask again). Pushes the real result
+    // into the feed the same way a normal submit() does; the resolved
+    // clarification card stays in place above/below it as a record of the
+    // choice, handled entirely by JoinClarification's own local state.
+    resubmit: (question, extra) => submit(question, extra),
   }))
 
-  async function submit(question) {
+  async function submit(question, extra) {
     const q = (question || input).trim()
     if (!q) return
 
     onLoading(true)
-    setInput("")
+    if (!extra) setInput("")   // only clear the input box for a fresh, typed submission
 
     try {
       const { data } = await axios.post(
         `${API_BASE}/query/${sessionId}`,
-        { question: q }
+        { question: q, ...(extra || {}) }
       )
       onResult({ question: q, ...data })
     } catch (e) {
@@ -60,6 +68,8 @@ const ChatPanel = forwardRef(function ChatPanel(
 
       <div className="chat-bar">
         <input
+          id="chat-question-input"
+          name="question"
           className="chat-input"
           value={input}
           onChange={e => setInput(e.target.value)}

@@ -441,6 +441,45 @@ body {
 
 /* ── KPI Bar ──────────────────────────────────────────────────────────── */
 /* ── Data Health Warnings ────────────────────────────────────────────── */
+/* ── Data Health Warnings: dismiss button ──────────────────────────────────
+   Add this to your main stylesheet, right after the existing
+   .health-warnings-container / .health-warnings-title / .health-warning-item
+   rules. Only new additions — nothing existing needs to change. */
+
+.health-warnings-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 6px;
+}
+
+/* Override the standalone .health-warnings-title's own margin-bottom now
+   that it sits inside a flex header row instead of alone. */
+.health-warnings-header .health-warnings-title {
+  margin-bottom: 0;
+}
+
+.health-warnings-dismiss {
+  background: transparent;
+  border: none;
+  color: #D97706;
+  opacity: 0.6;
+  font-size: 13px;
+  width: 20px;
+  height: 20px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 4px;
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: all 0.15s;
+}
+
+.health-warnings-dismiss:hover {
+  opacity: 1;
+  background: rgba(217, 119, 6, 0.12);
+}
 .health-warnings-container {
   background: #FFFBEB;
   border: 1px solid #FDE68A;
@@ -1161,4 +1200,300 @@ body {
   background: #64748B; 
   border: 2px solid transparent;
   background-clip: padding-box;
+}
+/* ── Top Bar: Data Sources dropdown ──────────────────────────────────────
+   Append this block to the end of your existing global stylesheet.
+   Replaces the old single-file topbar-file-info/live-badge/rows-badge
+   display with a dropdown that scales to any number of loaded tables. */
+
+.topbar-data-wrap {
+  position: relative;
+}
+
+.topbar-data-badge {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: rgba(16, 185, 129, 0.15);
+  border: 1px solid rgba(16, 185, 129, 0.3);
+  color: #10B981;
+  font-size: 12px;
+  font-weight: 600;
+  padding: 6px 12px;
+  border-radius: 999px;
+  cursor: pointer;
+  font-family: inherit;
+  transition: all 0.15s;
+}
+.topbar-data-badge:hover {
+  background: rgba(16, 185, 129, 0.22);
+}
+
+.topbar-data-chevron {
+  color: #10B981;
+  font-size: 10px;
+  margin-left: 2px;
+}
+
+.topbar-data-dropdown {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  background: white;
+  border: 1px solid #E2E8F0;
+  border-radius: 12px;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.14);
+  min-width: 260px;
+  max-width: 320px;
+  max-height: 70vh;
+  overflow-y: auto;
+  z-index: 200;
+  padding: 12px;
+}
+
+.topbar-data-dropdown-title {
+  font-size: 10px;
+  font-weight: 700;
+  color: #94A3B8;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  margin-bottom: 6px;
+}
+
+.topbar-data-source-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 13px;
+  color: #1E293B;
+  padding: 5px 2px;
+}
+
+.topbar-data-source-rows {
+  font-size: 11px;
+  color: #94A3B8;
+}
+
+.topbar-data-total {
+  font-size: 11px;
+  color: #94A3B8;
+  border-top: 1px solid #F1F5F9;
+  margin-top: 6px;
+  padding-top: 6px;
+}
+
+.topbar-data-dropdown-divider {
+  height: 1px;
+  background: #F1F5F9;
+  margin: 10px 0 8px;
+}
+
+.topbar-join-suggestion {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: 12px;
+  color: #4C1D95;
+  background: #F5F3FF;
+  border: 1px solid #DDD6FE;
+  border-radius: 8px;
+  padding: 8px 10px;
+  margin-bottom: 6px;
+  line-height: 1.4;
+}
+.topbar-join-suggestion:last-child {
+  margin-bottom: 0;
+}
+
+.topbar-join-suggestion-text {
+  min-width: 0;
+  flex: 1;
+}
+
+.topbar-join-columns {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 5px;
+}
+
+.topbar-join-col-tag {
+  background: white;
+  border: 1px solid #DDD6FE;
+  border-radius: 5px;
+  color: #6D28D9;
+  font-size: 10px;
+  font-weight: 600;
+  padding: 2px 6px;
+}
+
+.topbar-join-btn {
+  flex-shrink: 0;
+  background: #6366F1;
+  border: none;
+  border-radius: 6px;
+  color: white;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 5px 10px;
+  cursor: pointer;
+  transition: all 0.15s;
+  font-family: inherit;
+}
+.topbar-join-btn:hover:not(:disabled) {
+  background: #4F46E5;
+}
+.topbar-join-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+
+/* ── Sidebar: MySQL table browser ────────────────────────────────────────
+   The table list itself reuses .sidebar-table-item / .sidebar-row-count,
+   already defined earlier in this file — only the "loaded" tint below is
+   new. */
+
+.sidebar-table-item.loaded {
+  background: #F0FDF4;
+  border: 1px solid #BBF7D0;
+}
+.sidebar-table-item.loaded:hover {
+  background: #DCFCE7;
+}
+
+.mysql-connect-advanced-toggle {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 12px;
+  color: #94A3B8;
+  cursor: pointer;
+  padding: 8px 10px;
+  margin-top: 6px;
+  border-top: 1px solid #F1F5F9;
+}
+.mysql-connect-advanced-toggle:hover {
+  color: #6366F1;
+}
+
+.mysql-connect-panel {
+  margin-top: 6px;
+  padding: 12px;
+  border: 1px solid #E2E8F0;
+  border-radius: 12px;
+  background: #FAFBFC;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  animation: card-in 0.2s ease-out;
+}
+
+.mysql-connect-input,
+.mysql-connect-textarea {
+  background: white;
+  border: 1px solid #E2E8F0;
+  border-radius: 8px;
+  color: #0F172A;
+  padding: 8px 10px;
+  font-size: 13px;
+  outline: none;
+  transition: all 0.15s;
+  font-family: inherit;
+  width: 100%;
+  resize: vertical;
+}
+
+.mysql-connect-input::placeholder,
+.mysql-connect-textarea::placeholder {
+  color: #94A3B8;
+}
+
+.mysql-connect-input:focus,
+.mysql-connect-textarea:focus {
+  border-color: #6366F1;
+  box-shadow: 0 0 0 3px rgba(99,102,241,0.08);
+}
+
+.mysql-connect-input:disabled,
+.mysql-connect-textarea:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.mysql-connect-textarea {
+  font-family: "JetBrains Mono", "Fira Code", monospace;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.mysql-connect-error {
+  font-size: 12px;
+  color: #DC2626;
+  background: #FFF5F5;
+  border: 1px solid #FCA5A5;
+  border-radius: 6px;
+  padding: 6px 10px;
+  line-height: 1.4;
+}
+
+.mysql-connect-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 2px;
+}
+
+.mysql-connect-cancel {
+  flex: 1;
+  background: white;
+  border: 1px solid #E2E8F0;
+  border-radius: 8px;
+  color: #64748B;
+  font-size: 13px;
+  font-weight: 500;
+  padding: 8px 0;
+  cursor: pointer;
+  transition: all 0.15s;
+  font-family: inherit;
+}
+.mysql-connect-cancel:hover:not(:disabled) {
+  background: #F8FAFC;
+  color: #1E293B;
+}
+.mysql-connect-cancel:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.mysql-connect-submit {
+  flex: 1;
+  background: #0F172A;
+  border: none;
+  border-radius: 8px;
+  color: white;
+  font-size: 13px;
+  font-weight: 600;
+  padding: 8px 0;
+  cursor: pointer;
+  transition: all 0.15s;
+  font-family: inherit;
+}
+.mysql-connect-submit:hover:not(:disabled) {
+  background: #1E293B;
+}
+.mysql-connect-submit:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.mysql-connect-close {
+  font-size: 12px;
+  color: #94A3B8;
+  text-align: center;
+  cursor: pointer;
+  padding: 10px 0 2px;
+}
+.mysql-connect-close:hover {
+  color: #1E293B;
 }

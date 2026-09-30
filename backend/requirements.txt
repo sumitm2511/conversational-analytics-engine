@@ -10,8 +10,10 @@ numpy
 openpyxl
 xlrd
 
-# AI / LLM
-groq
+# AI / LLM (EricAI — OpenAI-compatible)
+openai
+httpx
+requests
 
 # Analytics & ML
 prophet
